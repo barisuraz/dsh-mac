@@ -19,7 +19,7 @@ The app starts `dsh web` for you, waits for it to listen, shows the GUI in a `WK
 
 DSH already ships a complete agent runtime and web UI. What it does not ship is a way to run that UI as an app: you start a server in a terminal, then open a browser tab, and now your coding agent shares a profile, a session, and a keyboard-shortcut namespace with your personal browsing.
 
-`dsh-mac` is about 800 lines of Swift that close that gap. It is a **shell, not a fork**: it implements no harness logic, reimplements no UI, and reads no DSH config, API, or plugin interface. Everything you see in the window is upstream DSH.
+`dsh-mac` is one Swift file of about 1000 lines that closes that gap. It is a **shell, not a fork**: it implements no harness logic, reimplements no UI, and reads no DSH config, API, or plugin interface. Everything you see in the window is upstream DSH.
 
 ## What it is not
 
@@ -132,5 +132,7 @@ Info.plist                  bundle metadata
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+The app icon uses the DeepSeek whale mark, and the outline is parsed from the same vector asset DSH ships in its own web frontend. The mark belongs to DeepSeek; it is used here only to identify what the app runs. Remove or replace it if you redistribute this under a different name. This project is not affiliated with or endorsed by DeepSeek.
 
 The app icon uses the DeepSeek whale mark, and the outline is parsed from the same vector asset DSH ships in its own web frontend. The mark belongs to DeepSeek; it is used here only to identify what the app runs. Remove or replace it if you redistribute this under a different name. This project is not affiliated with or endorsed by DeepSeek.
