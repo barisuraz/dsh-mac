@@ -1,0 +1,8 @@
+# Build output
+build/
+.build-cache/
+.icon-build/
+
+# Diagnostics and local test state
+*.log
+.checkhome/

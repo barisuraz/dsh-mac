@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # DSH is in developer preview and moves quickly. A weekly run turns upstream
+    # drift into a red build instead of a broken window for whoever installs next.
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+
+jobs:
+  build-and-verify:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          swiftc --version
+          sw_vers
+
+      - name: Build the app
+        run: ./build.sh
+
+      - name: Verify the bundle
+        run: |
+          APP="build/DeepSeek Harness.app"
+          test -x "$APP/Contents/MacOS/DeepSeekHarness"
+          test -f "$APP/Contents/Resources/AppIcon.icns"
+          codesign --verify --deep --strict "$APP" && echo "signature ok"
+
+      - name: Run the readiness-line parser tests
+        run: |
+          "build/DeepSeek Harness.app/Contents/MacOS/DeepSeekHarness" --test-parser
+
+      - name: Install DSH and verify the end-to-end contract
+        run: |
+          npm install -g @deepseek-ai/dsh
+          # Credentials are not needed to boot the server and serve the UI.
+          DSH_HOME="$RUNNER_TEMP/dsh-home" \
+            "build/DeepSeek Harness.app/Contents/MacOS/DeepSeekHarness" --check-contract

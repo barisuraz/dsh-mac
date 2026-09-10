@@ -1,0 +1,69 @@
+#!/bin/bash
+# Build "DeepSeek Harness.app" — a native macOS wrapper around `dsh web`.
+#
+# No dependencies beyond the Xcode Command Line Tools: swiftc compiles the whole
+# app, the icon is rendered from vectors, and the bundle is assembled and
+# ad-hoc signed in place. Nothing is downloaded.
+
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+APP="$HERE/build/DeepSeek Harness.app"
+BIN_NAME="DeepSeekHarness"
+CACHE="$HERE/.build-cache"
+
+command -v swiftc >/dev/null 2>&1 || {
+	echo "error: swiftc not found. Install the Xcode Command Line Tools:" >&2
+	echo "       xcode-select --install" >&2
+	exit 1
+}
+
+mkdir -p "$CACHE"
+
+# -module-cache-path keeps clang's module cache inside the project: the default
+# cache lives in the system temp directory, which a sandboxed shell may not write.
+COMMON_FLAGS=(-O -swift-version 5 -module-cache-path "$CACHE/modules")
+
+echo "==> compiling"
+rm -rf "$APP"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+
+# -swift-version 5 keeps the build free of strict-concurrency diagnostics on
+# Swift 6 toolchains, where this AppKit delegate code is main-thread by construction.
+swiftc \
+	"${COMMON_FLAGS[@]}" \
+	-framework AppKit \
+	-framework WebKit \
+	-o "$APP/Contents/MacOS/$BIN_NAME" \
+	"$HERE/Sources/main.swift"
+
+echo "==> assembling bundle"
+cp "$HERE/Info.plist" "$APP/Contents/Info.plist"
+printf 'APPL????' > "$APP/Contents/PkgInfo"
+
+echo "==> building icon"
+if command -v iconutil >/dev/null 2>&1; then
+	ICONSET="$CACHE/AppIcon.iconset"
+	rm -rf "$ICONSET"
+	swiftc "${COMMON_FLAGS[@]}" -o "$CACHE/make-icon" "$HERE/tools/make-icon.swift"
+	"$CACHE/make-icon" "$ICONSET" "$HERE/tools/deepseek-whale.path" >/dev/null
+	iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+else
+	echo "     (iconutil unavailable; building without an icon)"
+fi
+
+echo "==> ad-hoc signing"
+# Ad-hoc signing is enough for a locally built app. It is also what makes the
+# app's storage container stable, so the session cookie survives relaunches.
+codesign --force --sign - --timestamp=none "$APP" >/dev/null 2>&1 \
+	|| echo "     (ad-hoc signing skipped; the app still runs locally)"
+
+echo "==> built: $APP"
+echo
+echo "Launch it with:"
+echo "  open \"$APP\""
+echo
+echo "Diagnostics:"
+echo "  \"$APP/Contents/MacOS/$BIN_NAME\" --selftest        # what it resolved"
+echo "  \"$APP/Contents/MacOS/$BIN_NAME\" --test-parser     # readiness-line parser"
+echo "  \"$APP/Contents/MacOS/$BIN_NAME\" --check-contract  # end-to-end harness check"
