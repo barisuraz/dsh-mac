@@ -1,91 +1,83 @@
 # dsh-mac
 
-A native macOS window for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). It runs the real DSH web UI in its own app, so your coding agent does not share a browser profile, session, or keyboard-shortcut namespace with your personal browsing.
+A native macOS app for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). It runs the real DSH web UI in its own window, so your agent does not share a browser profile, session, or keyboard shortcuts with your personal browsing.
 
-The app starts `dsh web`, waits for it to listen, shows the GUI in a `WKWebView`, and stops the server when you quit.
+It starts `dsh web`, waits for it to listen, shows the GUI in a `WKWebView`, and stops the server when you quit.
 
-## What this is
+## Download
 
-One Swift file. It is a shell, not a fork: it implements no harness logic, reimplements no UI, and reads no DSH config, API, or plugin interface. Everything in the window is upstream DSH.
+Get the latest `dsh-mac-<version>.zip` from **[Releases](https://github.com/barisuraz/dsh-mac/releases)**, unzip it, and move `DeepSeek Harness.app` to Applications.
 
-It is not a chat client. It does not call any model API, store conversations, or manage credentials. It launches a harness and displays it.
-
-## Requirements
-
-- macOS 13 or later
-- The Xcode Command Line Tools (`xcode-select --install`)
-- Node and npm, to fetch the harness
-
-You do **not** need DSH installed beforehand. If you have it, the first launch uses your copy immediately; if you do not, the app fetches one.
-
-## Install
-
-```sh
-git clone https://github.com/barisuraz/dsh-mac
-cd dsh-mac
-./build.sh
-open "build/DeepSeek Harness.app"
-```
-
-`build.sh` downloads nothing. To keep it in your Applications folder:
-
-```sh
-cp -R "build/DeepSeek Harness.app" /Applications/
-```
-
-The app is ad-hoc signed rather than notarized, so a downloaded copy is quarantined by macOS. Either build it yourself as above, or clear the flag once:
+The build is ad-hoc signed rather than notarized, so macOS quarantines anything downloaded. Clear that once:
 
 ```sh
 xattr -dr com.apple.quarantine "/Applications/DeepSeek Harness.app"
 ```
 
-Maintainers can produce a notarized build that needs no such workaround; see [Releasing](#releasing).
+Then open it. Notarizing requires a paid Apple Developer account, so for now that one command is the difference. Building from source avoids it entirely.
+
+## Requirements
+
+- macOS 13 or later
+- Node and npm, to fetch the harness
+
+There is no need to install DSH first; see [First run](#first-run).
+
+## Or build from source
+
+Needs the Xcode Command Line Tools (`xcode-select --install`).
+
+```sh
+git clone https://github.com/barisuraz/dsh-mac
+cd dsh-mac
+./build.sh
+cp -R "build/DeepSeek Harness.app" /Applications/
+```
+
+`build.sh` downloads nothing and takes a few seconds.
+
+## What it is
+
+One Swift file. It is a shell, not a fork: no harness logic, no reimplemented UI, no DSH config, API, or plugin interface. Everything in the window is upstream DSH, so new harness features appear as soon as they ship.
+
+It is not a chat client. It calls no model API, stores no conversations, and manages no credentials.
 
 ## Updates
 
-DSH is in developer preview and changes constantly, so the app updates it for you on every launch. It does that the way Android does A/B system updates: two copies are kept, an update only ever lands in the idle one, and the running copy is never modified.
+DSH is in developer preview and changes constantly, so the app updates it on every launch, the way Android does A/B system updates. Two copies are kept and an update only ever lands in the idle one:
 
 ```
-        ┌───────────────┐         ┌───────────────┐
-        │    slot a     │         │    slot b     │
-        │  running now  │         │   fallback    │
-        └───────────────┘         └───────────────┘
-                 ▲                        ▲
-     boots from here            new version is
-     and keeps working          installed here
+slot a ── running now          new versions install into the idle slot,
+slot b ── known-good fallback   never over the copy you are using
 ```
 
-On launch:
-
-1. The app boots the preferred slot and shows your GUI. This does not wait for any download.
+1. The preferred slot boots and shows your GUI. No download is awaited.
 2. Once the running version has stayed up for a minute, the newest release is installed into the other slot.
-3. That copy is started on a throwaway port and must serve the UI before it is trusted. Only then is it marked ready.
-4. On the next launch it becomes the running version, and the version it replaced stays as the fallback.
+3. That copy starts on a throwaway port and must serve the UI before it is trusted.
+4. Next launch it becomes your version and the one it replaced stays as the fallback.
 
-If the new version turns out to be bad, the app recovers on its own and tells you:
+If a new version is bad, the app recovers on its own and says so:
 
-- **It will not start.** The startup check catches it before it ever becomes your running version, and it is discarded.
-- **It starts and then keeps dying.** A version that served and then stopped within a minute is counted as an early exit. Three of those and the app stops retrying, marks that version broken, and switches back to the other slot.
+- **It will not start.** Caught before it ever becomes your running version, and discarded.
+- **It starts then keeps dying.** Three early exits and the app stops retrying, marks it broken, and switches back.
 
-Either way a card appears at the top-right naming the version that failed, the version you are now running, and why. It stays until you dismiss it; ordinary progress notices fade on their own. Nothing is deleted behind your back: the slot that failed is kept and marked, and a version that failed to start is not downloaded again. `Check for Harness Updates` (`⌘U`) clears that verdict and retries; `Reinstall Harness…` rebuilds the idle slot from scratch.
+Either way a card names the version that failed, the version you are on now, and why. Warnings stay until dismissed; progress notices fade. A version that failed to start is not downloaded again — `⌘U` clears that and retries, and `Reinstall Harness…` rebuilds the idle slot.
 
-Two copies of the harness take roughly 600 MB, plus an npm cache the app keeps to itself in `~/Library/Application Support/DeepSeekHarness`. Your own npm cache is never touched.
+Both copies take roughly 600 MB, plus an npm cache the app keeps to itself under `~/Library/Application Support/DeepSeekHarness`. Your own npm cache is untouched.
 
 ### First run
 
-You never have to install DSH yourself. If no harness exists on the machine, the first launch installs one into a slot and serves it. If you already have one, the app uses that copy immediately — the first launch is as fast as you are used to — and provisions a managed slot in the background for the next one. Either way, your existing setup is left exactly as it was.
+You never have to install DSH yourself. If no harness exists, the first launch installs one and serves it. If you already have one, that copy is used immediately — the first launch is as fast as you are used to — and a managed slot is provisioned in the background. Either way your existing setup is left as it was.
 
-## Behaviour worth knowing
+## Behaviour
 
-**Your existing harness is left alone.** If port `3080` is already taken, the app asks the OS for a free port instead of fighting over it.
+**Your existing harness is left alone.** If port `3080` is taken, the app asks the OS for a free port instead of fighting over it.
 
-**Nothing outlives the app.** The server runs under a small supervisor that shuts it down even if the app is force-killed, so you will not find an orphaned `node` process holding a port.
+**Nothing outlives the app.** The server runs under a supervisor that shuts it down even if the app is force-killed, so no orphaned `node` process holds a port.
 
-**Its storage is its own.** The webview uses the app's own container, so cookies and local storage never mix with Chrome, Safari, or any other browser profile.
+**Sessions carry over.** The app uses the same `~/.dsh` as the command line, so existing sessions, workspaces, and credentials appear with no migration.
 
-**Your sessions carry over.** The app uses the same `~/.dsh` as the command line, so existing sessions, workspaces, and credentials appear with no migration.
-
-**It fails visibly.** If the harness cannot start, the window shows the reason and the last lines of the harness's own output rather than a blank page. The same text goes to `~/Library/Logs/DeepSeekHarness/wrapper.log`.
+**Storage is its own.** The webview uses the app's own container, so cookies and local storage never mix with Chrome or Safari.
 
 ## Configuration
 
@@ -94,12 +86,11 @@ All optional, read from the environment, so launch from a terminal to use them.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `DSH_WRAPPER_PORT` | `3080` | Port to prefer; falls back to an OS-assigned port if busy. |
-| `DSH_MANAGED` | `1` | Set to `0` to skip slots and updates entirely and use whatever `dsh` resolves to. |
-| `DSH_NO_AUTO_UPDATE` | `0` | Set to `1` to keep slots but never fetch anything on launch. |
+| `DSH_MANAGED` | `1` | Set to `0` to skip slots and updates and use whatever `dsh` resolves to. |
+| `DSH_NO_AUTO_UPDATE` | `0` | Set to `1` to keep slots but never fetch on launch. |
 | `DSH_NO_SYSTEM_DSH` | `0` | Set to `1` to ignore any harness on `PATH` and use only managed slots. |
-| `DSH_SLOT_VERSION` | newest | Pin slots to a specific version instead of tracking the newest. |
+| `DSH_SLOT_VERSION` | newest | Pin slots to a version instead of tracking the newest. |
 | `DSH_BIN` | auto-detected | Explicit path to a `dsh` executable. |
-| `DSH_NPM_BIN` | auto-detected | Explicit path to `npm`. |
 | `DSH_APP_SUPPORT` | `~/Library/Application Support/DeepSeekHarness` | Where slots and update state live. |
 | `DSH_WRAPPER_LOG` | `~/Library/Logs/DeepSeekHarness/wrapper.log` | Where to write diagnostics. |
 
@@ -117,99 +108,69 @@ All optional, read from the environment, so launch from a terminal to use them.
 
 ## Maintenance
 
-The real risk with any wrapper is that upstream moves and the wrapper rots. This one keeps its coupling to a single contract:
+The risk with any wrapper is that upstream moves and the wrapper rots, so this one stays coupled to a single contract:
 
 > 1. a `dsh` executable can be resolved,
 > 2. `dsh web --no-open --port N` serves the GUI on loopback,
 > 3. it prints a loopback URL carrying a `token` parameter.
 
-That is all of it. Keeping the coupling at the process boundary is deliberate; it is the most stable seam DSH offers, and it is why a shell needs less upkeep than a plugin or a fork.
-
-Claim 3 is a log line rather than a documented interface, so it is the part most likely to change. Two things guard it:
-
-- The parser accepts a reworded line, needing only *some* loopback URL carrying a token, not an exact prefix.
-- `--test-parser` and `--check-contract` fail loudly when upstream drifts. CI runs both on every push and weekly.
-
-If upstream changes something, you get a red build naming the claim that broke instead of a window that never loads.
-
-Because the window renders upstream's own frontend, new harness features appear in the app as soon as they ship. The app has nothing to reimplement and therefore nothing to fall behind on.
+Claim 3 is a log line rather than a documented interface, so `--test-parser` and `--check-contract` fail loudly when it drifts. CI runs both on every push and weekly, turning upstream changes into a red build naming the broken claim instead of a window that never loads.
 
 ### Diagnostics
 
 ```sh
-APP="build/DeepSeek Harness.app/Contents/MacOS/DeepSeekHarness"
+APP="/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeekHarness"
 
-# what the app resolved, without opening a window
-"$APP" --selftest
+"$APP" --selftest          # what it resolved
+"$APP" --test-parser       # readiness-line parser, including refusals
+"$APP" --test-update       # A/B slots and crash-loop detection
+"$APP" --test-notice       # notice card rendering
+"$APP" --install-harness   # fetch a harness into a slot, headless
+"$APP" --check-contract    # start a real harness and verify the contract
 
-# the readiness-line parser, including the cases it must refuse
-"$APP" --test-parser
-
-# A/B slot bookkeeping and crash-loop detection
-"$APP" --test-update
-
-# how the in-app notice card renders
-"$APP" --test-notice
-
-# fetch and verify a harness into a slot, without opening a window
-"$APP" --install-harness
-
-# starts a real harness and verifies the full contract
-"$APP" --check-contract
-
-# end-to-end recovery: drives the app against deliberately broken harnesses
-./tools/test-ab.sh
+./tools/test-ab.sh         # recovery, against deliberately broken harnesses
 ```
 
-## Security notes
+## Security
 
-The harness server runs local code execution behind a loopback URL. The app respects that boundary:
+The harness runs local code execution behind a loopback URL, and the app respects that boundary:
 
-- Only `http` URLs on `127.0.0.1` or `localhost` carrying a `token` parameter are ever loaded. The parser is tested against non-loopback and non-http input.
-- The token is read from the harness's own output and used once to load the GUI. It is redacted from all diagnostic output.
+- Only `http` URLs on `127.0.0.1` or `localhost` carrying a `token` are ever loaded, and the parser is tested against non-loopback input.
+- The token is read from the harness's output, used once, and redacted from all diagnostics.
 - DSH refuses to bind `0.0.0.0`, and this app does not change that.
-- Links to other sites open in your default browser rather than inside the harness window.
-- Installs run `npm install` with the app's own cache directory. Nothing is installed globally and no shell profile is modified.
+- Links to other sites open in your default browser, not in the harness window.
+- Installs run `npm install` with the app's own cache. Nothing is installed globally and no shell profile is modified.
 - DSH is in developer preview. Review anything you run against your own machine.
 
 ## Project layout
 
 ```
 Sources/main.swift          the entire app: window, launcher, supervisor, slots, diagnostics
-tools/make-icon.swift       the icon, drawn as vectors at each required size
-tools/deepseek-whale.path   the whale outline, taken from DSH's own frontend asset
+build.sh                    compiles, assembles, icons, and signs the bundle
 tools/test-ab.sh            end-to-end update and recovery tests
 tools/notarize.sh           sign, notarize, and staple a release build
-build.sh                    compiles, assembles, icons, and signs the bundle
-Info.plist                  bundle metadata
-.github/workflows/ci.yml    build, contract check, and both test suites
+tools/make-icon.swift       the icon, drawn as vectors at each required size
 ```
 
-## Releasing
+## Publishing a release
 
-Builds are ad-hoc signed by default, which is all a locally built copy needs. For a release other people can open without a Gatekeeper warning, the app has to be signed with a **Developer ID Application** certificate and notarized by Apple. That requires a paid Apple Developer account; there is no way around it.
+Builds are ad-hoc signed by default, which is all a local copy needs. A release other people can open without the quarantine step must be signed with a **Developer ID Application** certificate and notarized by Apple, which requires a paid Apple Developer account.
 
-`build.sh` always enables the hardened runtime, so what you test locally is what gets notarized. Set `DSH_SIGN_IDENTITY` to sign for distribution:
+`build.sh` always enables the hardened runtime, so what you test locally is what gets notarized:
 
 ```sh
 xcrun notarytool store-credentials "dsh-mac" \
-  --apple-id "you@example.com" \
-  --team-id "YOURTEAMID" \
-  --password "app-specific-password"
+  --apple-id "you@example.com" --team-id "YOURTEAMID" --password "app-specific-password"
 
-DSH_SIGN_IDENTITY="Developer ID Application: Your Name (YOURTEAMID)" \
-  ./tools/notarize.sh --check     # verify prerequisites first
-
-DSH_SIGN_IDENTITY="Developer ID Application: Your Name (YOURTEAMID)" \
-  ./tools/notarize.sh             # build, submit, staple
+DSH_SIGN_IDENTITY="Developer ID Application: Your Name (YOURTEAMID)" ./tools/notarize.sh
 ```
 
-The script builds and signs the app, refuses to continue if the signature is not Developer ID, not hardened, or not timestamped, submits the bundle with `notarytool --wait`, staples the ticket, checks that Gatekeeper accepts the result, and leaves a `build/dsh-mac-<version>.zip` ready to upload. The step-by-step setup for the certificate and the app-specific password is in the header of [tools/notarize.sh](tools/notarize.sh).
+The script builds, refuses to continue if the signature is not Developer ID, not hardened, or not timestamped, submits with `notarytool --wait`, staples the ticket, confirms Gatekeeper accepts it, and leaves `build/dsh-mac-<version>.zip` ready to upload. Setup details are in the header of [tools/notarize.sh](tools/notarize.sh).
 
-The app needs no entitlement exceptions: it is a plain AppKit app that spawns `node` and `zsh` as separate processes, and hardened runtime restrictions are per-binary, so the interpreter it launches is unaffected. `build.sh` will pick up a `tools/entitlements.plist` if one is ever needed.
+The app needs no entitlement exceptions: hardened runtime restrictions are per-binary, and it spawns `node` and `zsh` as separate processes.
 
 ## License
 
 MIT, see [LICENSE](LICENSE).
 
-The app icon uses the DeepSeek whale mark, parsed from the same vector asset DSH ships in its web frontend. The mark belongs to DeepSeek and is used here only to identify what the app runs. Replace it if you redistribute this under a different name. This project is not affiliated with or endorsed by DeepSeek.
+The app icon uses the DeepSeek whale mark, parsed from the vector asset DSH ships in its web frontend. The mark belongs to DeepSeek and is used only to identify what the app runs; replace it if you redistribute this under another name. Not affiliated with or endorsed by DeepSeek.

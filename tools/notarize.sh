@@ -175,11 +175,22 @@ echo "  [ ok ] Gatekeeper accepts the app"
 rm -f "$ZIP"
 /usr/bin/ditto -c -k --keepParent "$APP" "$ZIP"
 
+# A stable asset name lets install.sh build a plain download URL that does not
+# need to know the version, and it is what the README one-liner relies on.
+STABLE="$HERE/build/dsh-mac.zip"
+cp "$ZIP" "$STABLE"
+
+# Checksums let install.sh catch a corrupted or substituted download.
+SUMS="$HERE/build/SHA256SUMS"
+( cd "$HERE/build" && shasum -a 256 "dsh-mac-$VERSION.zip" "dsh-mac.zip" > "$(basename "$SUMS")" )
+
 echo
 echo "──────────────────────────────────────────"
 echo "notarized and stapled: DeepSeek Harness $VERSION"
 echo
-echo "Release asset, ready to upload:"
+echo "Release assets, ready to upload:"
 echo "  $ZIP"
+echo "  $STABLE   (stable name, used by install.sh)"
+echo "  $SUMS"
 echo
 echo "Anyone can now open it after downloading, with no xattr workaround."

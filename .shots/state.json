@@ -1,0 +1,18 @@
+{
+  "preferred" : "a",
+  "rejected" : {
+
+  },
+  "slots" : {
+    "a" : {
+      "broken" : false,
+      "earlyExits" : [
+
+      ],
+      "installedAt" : 810737736.428406,
+      "verifiedAt" : 810737855.140727,
+      "version" : "0.1.5-rc.1"
+    }
+  },
+  "updatedAt" : 810737736.428458
+}

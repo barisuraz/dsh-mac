@@ -1112,8 +1112,64 @@ final class HarnessServer {
     }
 }
 
-// MARK: - Notice card
+// MARK: - Screenshots
 
+/// A request to render the window to a file, used to produce documentation
+/// images without screen recording permission.
+struct ScreenshotRequest {
+    /// Whether to include a sample notice, so the README can show one.
+    enum Note: Equatable {
+        case none
+        case rollback
+        case staged
+
+        var message: (title: String, detail: String)? {
+            switch self {
+            case .none:
+                return nil
+            case .rollback:
+                return (
+                    "Harness 0.1.6 did not start — back on 0.1.5",
+                    "It never began serving the interface, so the app switched back automatically. "
+                        + "0.1.6 will not be tried again. See the log for details."
+                )
+            case .staged:
+                return (
+                    "Harness 0.1.5 is ready",
+                    "Verified and waiting. It will be used the next time this app launches."
+                )
+            }
+        }
+    }
+
+    let path: String
+    let note: Note
+
+    /// Parse `--screenshot <path> [--notice rollback|staged]`, or nil when the
+    /// app is being launched normally.
+    init?(arguments: [String]) {
+        guard let flag = arguments.firstIndex(of: "--screenshot") else { return nil }
+        guard arguments.index(after: flag) < arguments.endIndex else {
+            Log.shared.write("--screenshot needs a destination path")
+            exit(2)
+        }
+        path = arguments[arguments.index(after: flag)]
+
+        var parsed = Note.none
+        if let noticeFlag = arguments.firstIndex(of: "--notice"),
+            arguments.index(after: noticeFlag) < arguments.endIndex
+        {
+            switch arguments[arguments.index(after: noticeFlag)] {
+            case "rollback": parsed = .rollback
+            case "staged": parsed = .staged
+            default: parsed = .none
+            }
+        }
+        note = parsed
+    }
+}
+
+// MARK: - Notice card
 /// A small floating card reporting something about the app itself: an update
 /// that is ready, or a version that was rolled back.
 ///
@@ -1339,6 +1395,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     private var banner: NoticeCard?
     /// Pending auto-dismiss for an informational notice.
     private var bannerDismissWork: DispatchWorkItem?
+    /// Set when the app is rendering itself to a file for documentation.
+    private var pendingScreenshot: ScreenshotRequest?
 
     private var preferredPort: Int {
         let raw = ProcessInfo.processInfo.environment["DSH_WRAPPER_PORT"] ?? ""
@@ -1351,8 +1409,159 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         buildMenu()
         buildWindow()
         wireServer()
+
+        // Documentation mode: the app renders its own window to a file. This is
+        // how the README's screenshots are produced without depending on screen
+        // recording permission, and it captures the real webview rather than an
+        // approximation of it.
+        if let request = ScreenshotRequest(arguments: arguments) {
+            pendingScreenshot = request
+            // A fixed size keeps screenshots consistent between runs.
+            window.setContentSize(NSSize(width: 1280, height: 820))
+        }
+
         startHarness("app launch")
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    /// Capture the window to a PNG, then optionally show a notice and quit.
+    ///
+    /// The webview draws out of process, so its pixels are taken with the
+    /// snapshot API rather than by caching the view, which would come back
+    /// blank. The window chrome is drawn alongside it so the result looks like
+    /// the app rather than a bare web page.
+    private func captureWindow(to path: String, note: ScreenshotRequest.Note) {
+        pendingScreenshot = nil
+
+        // Let the frontend finish its first paint, and give the notice card a
+        // moment to animate in when one is being shown.
+        let settle: TimeInterval = note == .none ? 2.5 : 1.0
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + settle) { [weak self] in
+            guard let self else { return }
+
+            if let message = note.message {
+                self.showBanner(message.title, detail: message.detail, kind: .warning)
+            }
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + (note == .none ? 0.4 : 1.2)) {
+                let configuration = WKSnapshotConfiguration()
+                configuration.rect = self.webView.bounds
+                self.webView.takeSnapshot(with: configuration) { image, error in
+                    guard let image else {
+                        Log.shared.write("screenshot failed: \(error?.localizedDescription ?? "no image")")
+                        exit(1)
+                    }
+                    self.composeAndWrite(image, to: path)
+                }
+            }
+        }
+    }
+
+    /// Draw the window chrome around the captured page and write the result out.
+    ///
+    /// `lockFocus` uses an unflipped, bottom-left origin, so the page sits at
+    /// the bottom of the composite and the title bar goes *above* it. Getting
+    /// this backwards draws the bar underneath the page, where the page then
+    /// paints over it.
+    private func composeAndWrite(_ page: NSImage, to path: String) {
+        let titleHeight: CGFloat = 28
+        let pageSize = page.size
+        let size = NSSize(width: pageSize.width, height: pageSize.height + titleHeight)
+
+        let composite = NSImage(size: size)
+        composite.lockFocus()
+
+        // Round only the top corners, the way a real window is shaped.
+        let radius: CGFloat = 10
+        let shape = NSBezierPath()
+        shape.move(to: NSPoint(x: 0, y: 0))
+        shape.line(to: NSPoint(x: 0, y: size.height - radius))
+        shape.appendArc(
+            withCenter: NSPoint(x: radius, y: size.height - radius), radius: radius,
+            startAngle: 180, endAngle: 90)
+        shape.line(to: NSPoint(x: size.width - radius, y: size.height))
+        shape.appendArc(
+            withCenter: NSPoint(x: size.width - radius, y: size.height - radius), radius: radius,
+            startAngle: 90, endAngle: 0)
+        shape.line(to: NSPoint(x: size.width, y: 0))
+        shape.close()
+        shape.addClip()
+
+        NSColor.windowBackgroundColor.setFill()
+        NSRect(origin: .zero, size: size).fill()
+
+        // The page occupies the bottom of the composite.
+        page.draw(
+            in: NSRect(x: 0, y: 0, width: pageSize.width, height: pageSize.height),
+            from: .zero, operation: .copy, fraction: 1.0)
+
+        let bar = NSRect(x: 0, y: pageSize.height, width: size.width, height: titleHeight)
+        NSColor.windowBackgroundColor.setFill()
+        bar.fill()
+        NSColor.separatorColor.setFill()
+        NSRect(x: 0, y: pageSize.height, width: size.width, height: 1).fill()
+
+        // Traffic lights, drawn rather than captured so the image does not
+        // depend on how the window happens to be configured.
+        let colors: [NSColor] = [.systemRed, .systemYellow, .systemGreen]
+        for (index, color) in colors.enumerated() {
+            color.setFill()
+            NSBezierPath(
+                ovalIn: NSRect(
+                    x: 14 + CGFloat(index) * 20, y: pageSize.height + titleHeight / 2 - 6,
+                    width: 12, height: 12)
+            ).fill()
+        }
+
+        let title = NSAttributedString(
+            string: "DeepSeek Harness",
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 13, weight: .semibold),
+                .foregroundColor: NSColor.secondaryLabelColor,
+            ])
+        let titleSize = title.size()
+        title.draw(
+            at: NSPoint(
+                x: (size.width - titleSize.width) / 2,
+                y: pageSize.height + (titleHeight - titleSize.height) / 2))
+
+        drawNoticeCard()
+
+        composite.unlockFocus()
+
+        guard let tiff = composite.tiffRepresentation,
+            let rep = NSBitmapImageRep(data: tiff),
+            let png = rep.representation(using: .png, properties: [:])
+        else {
+            Log.shared.write("screenshot failed: could not encode the image")
+            exit(1)
+        }
+        do {
+            try png.write(to: URL(fileURLWithPath: path))
+            print("wrote \(path) (\(Int(size.width))x\(Int(size.height)))")
+            Log.shared.write("wrote screenshot to \(path)")
+            exit(0)
+        } catch {
+            Log.shared.write("screenshot failed: \(error.localizedDescription)")
+            exit(1)
+        }
+    }
+
+    /// Draw the notice card into the current focus, if one is on screen.
+    ///
+    /// The card is a sibling of the webview, not part of it, so it is absent
+    /// from the page snapshot and has to be rendered separately. It is an
+    /// ordinary view, so caching its display works; the webview could not be
+    /// captured that way because it draws out of process.
+    private func drawNoticeCard() {
+        guard let card = banner, card.frame.width > 1 else { return }
+        guard let rep = card.bitmapImageRepForCachingDisplay(in: card.bounds) else { return }
+        card.cacheDisplay(in: card.bounds, to: rep)
+
+        let image = NSImage(size: card.bounds.size)
+        image.addRepresentation(rep)
+        image.draw(in: card.frame, from: .zero, operation: .sourceOver, fraction: 1.0)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -1908,6 +2117,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         Log.shared.write("navigation finished: \(webView.url?.absoluteString ?? "?")")
         overlay.hideOverlay()
+        if let request = pendingScreenshot { captureWindow(to: request.path, note: request.note) }
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
