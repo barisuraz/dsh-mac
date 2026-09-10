@@ -72,6 +72,11 @@ final class Log {
 // MARK: - Locating the harness
 
 enum Locator {
+    /// Carries a pipe's contents across the queue that drains it.
+    final class ErrorBox: @unchecked Sendable {
+        var data = Data()
+    }
+
     /// Read a boolean-ish environment variable.
     static func flag(_ name: String, default defaultValue: Bool = false) -> Bool {
         guard let raw = ProcessInfo.processInfo.environment[name] else { return defaultValue }
@@ -215,16 +220,22 @@ enum Locator {
 
     /// Run a command and return its stdout, or nil if it could not start or
     /// exceeded `timeout`. Used for the small npm queries the updater makes.
+    ///
+    /// stderr is captured rather than discarded. These commands are how the
+    /// updater decides whether an update is even possible, and when one fails
+    /// the reason is on stderr — nulling it turned "npm cannot write its cache"
+    /// into an unexplained empty result, silently disabling every update.
     static func run(
         _ executable: String, _ arguments: [String], timeout: TimeInterval,
         environment: [String: String]? = nil
     ) -> String? {
         let process = Process()
         let output = Pipe()
+        let errors = Pipe()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
         process.standardOutput = output
-        process.standardError = FileHandle.nullDevice
+        process.standardError = errors
         process.standardInput = FileHandle.nullDevice
         if let environment {
             process.environment = ProcessInfo.processInfo.environment.merging(environment) { _, new in new }
@@ -236,6 +247,16 @@ enum Locator {
             return nil
         }
 
+        // Drain stderr on another queue: a child that fills the 64 KB pipe
+        // buffer would otherwise block forever and hang the launch.
+        let errorQueue = DispatchQueue(label: "dsh.locator.stderr")
+        let errorBox = ErrorBox()
+        let drained = DispatchSemaphore(value: 0)
+        errorQueue.async {
+            errorBox.data = errors.fileHandleForReading.readDataToEndOfFile()
+            drained.signal()
+        }
+
         let deadline = Date().addingTimeInterval(timeout)
         while process.isRunning && Date() < deadline {
             RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
@@ -243,10 +264,23 @@ enum Locator {
         if process.isRunning {
             Log.shared.write("\(executable) timed out after \(Int(timeout))s")
             process.terminate()
+            _ = drained.wait(timeout: .now() + 2)
+            let text = String(data: errorBox.data, encoding: .utf8) ?? ""
+            if !text.isEmpty { Log.shared.write("\(executable) stderr: \(Locator.condense(text, limit: 300))") }
             return nil
         }
         let data = output.fileHandleForReading.readDataToEndOfFile()
-        return String(data: data, encoding: .utf8)
+        _ = drained.wait(timeout: .now() + 5)
+        let stdout = String(data: data, encoding: .utf8) ?? ""
+
+        // Report a failure even when the caller only wants stdout: an empty
+        // result with no explanation is what makes this class of bug invisible.
+        if process.terminationStatus != 0 {
+            let text = String(data: errorBox.data, encoding: .utf8) ?? ""
+            Log.shared.write(
+                "\(executable) exited \(process.terminationStatus): \(Locator.condense(text, limit: 300))")
+        }
+        return stdout
     }
 
     /// True when nothing is accepting connections on `127.0.0.1:<port>`.
@@ -541,6 +575,10 @@ final class ManagedInstall {
         queue.async { [weak self] in
             guard let self else { return completion(.unavailable(nil)) }
             let target = self.state.other(than: activeSlot)
+
+            if activeSlot == nil {
+                Log.shared.write("update: no managed slot yet, provisioning slot \(target)")
+            }
 
             guard let npm = Locator.npmPath() else {
                 Log.shared.write("update skipped: npm not found")
@@ -1272,7 +1310,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             self.readyAt = Date()
             // This copy demonstrably boots and serves, so record it as good and,
             // if it was a staged update, make it the version we return to.
-            let promoted = self.managed.state.staged == self.bootingSlot
+            // Only a real slot promotion counts. Comparing optionals directly
+            // would treat "no slot at all" as a promotion, since nil == nil.
+            let promoted = self.bootingSlot.map { self.managed.state.staged == $0 } ?? false
             self.managed.recordHealthy(slot: self.bootingSlot)
             if promoted { self.reportUpdateAdopted() }
             self.runningSlot = self.bootingSlot
@@ -1393,19 +1433,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         }
 
         if let candidate = managed.resolveBootCandidate() {
+            // A candidate with no slot means it came from PATH. That is the
+            // first-run case: use the harness already installed so the launch is
+            // instant rather than a download, and provision a managed slot in
+            // the background once it is serving. This is also what makes
+            // switching to this app non-destructive — the first run behaves
+            // exactly like whatever you were using before.
+            if candidate.slot == nil {
+                Log.shared.write(
+                    "no managed slot yet; booting the installed dsh and provisioning one in the background")
+            }
             launch(dsh: candidate.dsh, slot: candidate.slot)
-            return
-        }
-
-        // No managed copy yet. When a harness is already installed, use it
-        // immediately so the first launch is instant rather than a download,
-        // and provision a managed slot in the background for next time. This is
-        // also what makes switching to this app non-destructive: the first run
-        // behaves exactly like whatever you were using before.
-        if let system = Locator.dshPath() {
-            Log.shared.write(
-                "no managed slot yet; starting your installed dsh and provisioning one in the background")
-            launch(dsh: system, slot: nil)
             return
         }
 

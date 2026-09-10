@@ -1,0 +1,8 @@
+{
+  "rejected" : {
+    "0.1.5-rc.1" : "The Harness server exited during startup (exit 1). — path: '\/Users\/baris\/.dsh\/profiles\/web\/cordis.yml' \/ } \/ Node.js v22.23.2"
+  },
+  "slots" : {
+
+  }
+}
