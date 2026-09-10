@@ -134,5 +134,3 @@ Info.plist                  bundle metadata
 MIT — see [LICENSE](LICENSE).
 
 The app icon uses the DeepSeek whale mark, and the outline is parsed from the same vector asset DSH ships in its own web frontend. The mark belongs to DeepSeek; it is used here only to identify what the app runs. Remove or replace it if you redistribute this under a different name. This project is not affiliated with or endorsed by DeepSeek.
-
-The app icon uses the DeepSeek whale mark, and the outline is parsed from the same vector asset DSH ships in its own web frontend. The mark belongs to DeepSeek; it is used here only to identify what the app runs. Remove or replace it if you redistribute this under a different name. This project is not affiliated with or endorsed by DeepSeek.
