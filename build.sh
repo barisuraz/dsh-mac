@@ -30,12 +30,40 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 # -swift-version 5 keeps the build free of strict-concurrency diagnostics on
 # Swift 6 toolchains, where this AppKit delegate code is main-thread by construction.
-swiftc \
-	"${COMMON_FLAGS[@]}" \
-	-framework AppKit \
-	-framework WebKit \
-	-o "$APP/Contents/MacOS/$BIN_NAME" \
-	"$HERE/Sources/main.swift"
+#
+# Both architectures are built and merged so the app also runs on Intel Macs.
+# If the second slice cannot be produced the build falls back to the host
+# architecture rather than failing, since a working native build is what matters.
+TARGET_MIN="13.0"
+SLICES=()
+for arch in arm64 x86_64; do
+	OUT="$CACHE/app-$arch"
+	if swiftc \
+		"${COMMON_FLAGS[@]}" \
+		-target "$arch-apple-macos$TARGET_MIN" \
+		-framework AppKit \
+		-framework WebKit \
+		-o "$OUT" \
+		"$HERE/Sources/main.swift" 2>"$CACHE/compile-$arch.log"; then
+		SLICES+=("$OUT")
+		echo "     $arch ok"
+	else
+		echo "     $arch unavailable (see $CACHE/compile-$arch.log)"
+	fi
+done
+
+if [ ${#SLICES[@]} -eq 0 ]; then
+	echo "error: no architecture could be compiled" >&2
+	exit 1
+fi
+
+if [ ${#SLICES[@]} -gt 1 ]; then
+	lipo -create -output "$APP/Contents/MacOS/$BIN_NAME" "${SLICES[@]}"
+	echo "     universal: $(lipo -archs "$APP/Contents/MacOS/$BIN_NAME")"
+else
+	cp "${SLICES[0]}" "$APP/Contents/MacOS/$BIN_NAME"
+	echo "     single architecture: $(lipo -archs "$APP/Contents/MacOS/$BIN_NAME")"
+fi
 
 echo "==> assembling bundle"
 cp "$HERE/Info.plist" "$APP/Contents/Info.plist"
