@@ -46,6 +46,26 @@ jobs:
       - name: Run the end-to-end recovery tests
         run: ./tools/test-ab.sh
 
+      - name: Package a release disk image and verify it round-trips
+        run: |
+          # Builds the DMG, mounts it, and confirms the app inside still has a
+          # valid signature and that no files were added to the bundle. This is
+          # the check that catches the class of bug that shipped in v1.1, where
+          # AppleDouble files invalidated the signature of the released app.
+          ./tools/package.sh
+
+      - name: Verify the installer against the packaged disk image
+        run: |
+          # Serve the local build over HTTP so install.sh can be exercised
+          # without publishing a release, by pointing it at a file URL.
+          DSH_INSTALL_DIR="$RUNNER_TEMP/install-target" \
+          DSH_NO_OPEN=1 \
+          DSH_SOURCE_DIR="$PWD/build" \
+            sh install.sh
+          test -d "$RUNNER_TEMP/install-target/DeepSeek Harness.app"
+          codesign --verify --deep --strict "$RUNNER_TEMP/install-target/DeepSeek Harness.app"
+          echo "installed and verifies"
+
       - name: Verify first-run provisioning installs a harness into a slot
         run: |
           # No harness on PATH, no existing slots: the app must fetch and verify

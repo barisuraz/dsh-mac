@@ -19,3 +19,11 @@ build/
 .firstrun/
 .hr-app/
 .hr-test-home/
+.instest/
+.shots/
+.shot-home/
+.shots.log
+.cmp/
+.sig/
+.rel/
+.dmgtest/

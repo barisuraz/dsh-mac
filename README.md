@@ -4,17 +4,25 @@ A native macOS app for [DeepSeek Harness](https://github.com/deepseek-ai/deepsee
 
 It starts `dsh web`, waits for it to listen, shows the GUI in a `WKWebView`, and stops the server when you quit.
 
-## Download
+![The app window](docs/app.png)
 
-Get the latest `dsh-mac-<version>.zip` from **[Releases](https://github.com/barisuraz/dsh-mac/releases)**, unzip it, and move `DeepSeek Harness.app` to Applications.
+## Install
 
-The build is ad-hoc signed rather than notarized, so macOS quarantines anything downloaded. Clear that once:
+One command. It downloads the latest release, checks its checksum and signature, puts the app in `/Applications`, trusts it, and opens it:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/barisuraz/dsh-mac/main/install.sh | sh
+```
+
+Or do it by hand: open the `dsh-mac-<version>.dmg` from **[Releases](https://github.com/barisuraz/dsh-mac/releases)** and drag the app to Applications, then clear the quarantine flag yourself:
 
 ```sh
 xattr -dr com.apple.quarantine "/Applications/DeepSeek Harness.app"
 ```
 
-Then open it. Notarizing requires a paid Apple Developer account, so for now that one command is the difference. Building from source avoids it entirely.
+That flag is needed because the build is ad-hoc signed rather than notarized, which requires a paid Apple Developer account. Building from source avoids it entirely.
+
+`install.sh` reads three optional variables: `DSH_INSTALL_DIR`, `DSH_VERSION` (a tag such as `v1.2`), and `DSH_NO_OPEN`.
 
 ## Requirements
 
@@ -61,7 +69,9 @@ If a new version is bad, the app recovers on its own and says so:
 - **It will not start.** Caught before it ever becomes your running version, and discarded.
 - **It starts then keeps dying.** Three early exits and the app stops retrying, marks it broken, and switches back.
 
-Either way a card names the version that failed, the version you are on now, and why. Warnings stay until dismissed; progress notices fade. A version that failed to start is not downloaded again — `⌘U` clears that and retries, and `Reinstall Harness…` rebuilds the idle slot.
+Either way a card names the version that failed, the version you are on now, and why. Warnings stay until dismissed; progress notices fade.
+
+![A rollback notice](docs/notice.png) A version that failed to start is not downloaded again — `⌘U` clears that and retries, and `Reinstall Harness…` rebuilds the idle slot.
 
 Both copies take roughly 600 MB, plus an npm cache the app keeps to itself under `~/Library/Application Support/DeepSeekHarness`. Your own npm cache is untouched.
 
@@ -127,6 +137,7 @@ APP="/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeekHarness"
 "$APP" --test-notice       # notice card rendering
 "$APP" --install-harness   # fetch a harness into a slot, headless
 "$APP" --check-contract    # start a real harness and verify the contract
+"$APP" --screenshot out.png --notice rollback   # render the window to a PNG
 
 ./tools/test-ab.sh         # recovery, against deliberately broken harnesses
 ```
@@ -146,10 +157,14 @@ The harness runs local code execution behind a loopback URL, and the app respect
 
 ```
 Sources/main.swift          the entire app: window, launcher, supervisor, slots, diagnostics
+install.sh                  the download-and-install one-liner
 build.sh                    compiles, assembles, icons, and signs the bundle
-tools/test-ab.sh            end-to-end update and recovery tests
+tools/package.sh            builds a release disk image and verifies it by mounting it
+tools/make-dmg.sh           the disk image itself
 tools/notarize.sh           sign, notarize, and staple a release build
+tools/test-ab.sh            end-to-end update and recovery tests
 tools/make-icon.swift       the icon, drawn as vectors at each required size
+docs/                       screenshots, rendered by the app itself
 ```
 
 ## Publishing a release
@@ -165,7 +180,9 @@ xcrun notarytool store-credentials "dsh-mac" \
 DSH_SIGN_IDENTITY="Developer ID Application: Your Name (YOURTEAMID)" ./tools/notarize.sh
 ```
 
-The script builds, refuses to continue if the signature is not Developer ID, not hardened, or not timestamped, submits with `notarytool --wait`, staples the ticket, confirms Gatekeeper accepts it, and leaves `build/dsh-mac-<version>.zip` ready to upload. Setup details are in the header of [tools/notarize.sh](tools/notarize.sh).
+The script builds, refuses to continue if the signature is not Developer ID, not hardened, or not timestamped, then notarizes and staples **both** the app and the disk image, confirming Gatekeeper accepts each. It leaves `build/dsh-mac-<version>.dmg` ready to upload. Setup details are in the header of [tools/notarize.sh](tools/notarize.sh).
+
+Submitting the image alone would notarize the app inside it, but only the image would carry a staple, and `install.sh` copies the app out into `/Applications` where it is then assessed on its own. Both are notarized so each artifact is self-sufficient.
 
 The app needs no entitlement exceptions: hardened runtime restrictions are per-binary, and it spawns `node` and `zsh` as separate processes.
 

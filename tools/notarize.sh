@@ -141,8 +141,15 @@ echo "  [ ok ] secure timestamp present"
 
 # ── submit ───────────────────────────────────────────────────────────────────
 
+# The app and the disk image are notarized separately, on purpose. Submitting
+# the image alone would notarize everything inside it, but only the image would
+# carry a staple. install.sh copies the app out of the image into /Applications,
+# and the app is then assessed on its own, so it needs its own ticket to launch
+# without a network round trip. Notarizing both costs one extra submission and
+# makes each artifact self-sufficient.
+
 echo
-echo "packaging for submission"
+echo "packaging the app for submission"
 # ditto preserves symlinks and metadata; plain zip can corrupt a bundle.
 rm -f "$ZIP"
 /usr/bin/ditto -c -k --keepParent "$APP" "$ZIP"
@@ -161,8 +168,8 @@ fi
 
 echo
 echo "stapling the ticket to the app"
-# The ticket must be stapled to the .app, then repackaged: a stapled app opens
-# without a network round trip, which is what makes the first launch clean.
+# The ticket is stapled before the image is built, so the copy of the app that
+# ends up inside the image already carries it.
 xcrun stapler staple "$APP"
 xcrun stapler validate "$APP"
 
@@ -171,26 +178,70 @@ if ! spctl --assess --type execute --verbose=2 "$APP" 2>&1 | grep -q "accepted";
 fi
 echo "  [ ok ] Gatekeeper accepts the app"
 
-# Repackage now that the ticket is stapled inside the bundle.
-rm -f "$ZIP"
-/usr/bin/ditto -c -k --keepParent "$APP" "$ZIP"
+# ── disk image ───────────────────────────────────────────────────────────────
+# The release asset is a DMG: GitHub release assets are single files, so a .app
+# bundle cannot be uploaded directly. It is built from the already-stapled app,
+# so the ticket is inside the bundle the image carries.
 
-# A stable asset name lets install.sh build a plain download URL that does not
-# need to know the version, and it is what the README one-liner relies on.
-STABLE="$HERE/build/dsh-mac.zip"
-cp "$ZIP" "$STABLE"
+echo
+echo "building the disk image"
+DMG="$HERE/build/dsh-mac-$VERSION.dmg"
+STABLE="$HERE/build/dsh-mac.dmg"
+rm -f "$DMG" "$STABLE"
+"$HERE/tools/make-dmg.sh" "$APP" "$DMG"
+
+# The image itself has to be signed, not just the app inside it. Apple requires
+# that a signed disk image be notarized, and a notarized one be stapled; signing
+# it is what ties the image to the same Developer ID as the app.
+echo
+echo "signing the disk image"
+codesign --force --timestamp --sign "$IDENTITY" "$DMG"
+if ! codesign --verify --verbose=2 "$DMG" 2>&1 | grep -q "valid on disk"; then
+	fail "the disk image signature does not verify"
+fi
+echo "  [ ok ] signed by: $IDENTITY"
+
+cp "$DMG" "$STABLE"
+
+# Notarize the image rather than the app a second time. Submitting a DMG
+# notarizes everything inside it, so one submission covers both, and stapling
+# the image attaches a ticket that Gatekeeper reads when the image is mounted.
+echo
+echo "notarizing the disk image"
+if ! xcrun notarytool submit "$DMG" --keychain-profile "$PROFILE" --wait; then
+	fail "Apple rejected the disk image"
+fi
+xcrun stapler staple "$DMG"
+xcrun stapler validate "$DMG"
+
+if ! spctl --assess --type open --context context:primary-signature --verbose=2 "$DMG" 2>&1 | grep -q "accepted"; then
+	fail "Gatekeeper rejects the disk image" "the staple did not take effect"
+fi
+echo "  [ ok ] Gatekeeper accepts the disk image"
+
+# Verify by mounting it, which is what a user will do.
+MOUNT=$(mktemp -d)
+hdiutil attach "$STABLE" -nobrowse -readonly -mountpoint "$MOUNT" >/dev/null
+if ! codesign --verify --deep --strict "$MOUNT/DeepSeek Harness.app" 2>/dev/null; then
+	hdiutil detach "$MOUNT" >/dev/null 2>&1 || true
+	fail "the app inside the disk image does not verify"
+fi
+hdiutil detach "$MOUNT" >/dev/null 2>&1 || true
+rm -rf "$MOUNT"
+echo "  [ ok ] the app inside the image verifies"
 
 # Checksums let install.sh catch a corrupted or substituted download.
 SUMS="$HERE/build/SHA256SUMS"
-( cd "$HERE/build" && shasum -a 256 "dsh-mac-$VERSION.zip" "dsh-mac.zip" > "$(basename "$SUMS")" )
+( cd "$HERE/build" && shasum -a 256 "dsh-mac-$VERSION.dmg" "dsh-mac.dmg" > SHA256SUMS )
 
 echo
 echo "──────────────────────────────────────────"
 echo "notarized and stapled: DeepSeek Harness $VERSION"
 echo
 echo "Release assets, ready to upload:"
-echo "  $ZIP"
+echo "  $DMG"
 echo "  $STABLE   (stable name, used by install.sh)"
 echo "  $SUMS"
 echo
 echo "Anyone can now open it after downloading, with no xattr workaround."
+sed 's/^/  /' "$SUMS"

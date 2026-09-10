@@ -1,19 +1,18 @@
 #!/bin/sh
 #
-# Build and package a release, without notarizing.
+# Build and package a release as a disk image, without notarizing.
 #
 # Used for ad-hoc releases, which are what this project publishes until there is
-# a Developer ID certificate. For a notarized build use tools/notarize.sh, which
-# packages with the same rules.
+# a Developer ID certificate. tools/notarize.sh produces a notarized image and
+# uses the same builder.
 #
-# Why this exists rather than a `zip` command: a release zip must not add
-# anything to the bundle. `zip -r` stores extended attributes and resource forks
-# as AppleDouble `._*` entries, which reappear inside the bundle when a user
-# unpacks it, and any added file invalidates the code signature. The released
-# v1.1 asset had exactly that problem: `codesign --verify` reported "a sealed
-# resource is missing or invalid" and listed seven `._*` files that had been
-# added. `ditto -c -k --keepParent` preserves the bundle exactly, so the
-# signature still verifies after the download.
+# The packaging here is careful for a specific reason. The v1.1 release was a zip
+# made by `zip`/`unzip`, which store extended attributes as AppleDouble `._*`
+# entries; those reappear inside the bundle on unpacking, and any added file
+# invalidates the code signature. `codesign --verify` on a downloaded v1.1 app
+# reported "a sealed resource is missing or invalid". This script therefore
+# mounts its own output and checks the signature survived and that no files were
+# added, which is the check that would have caught it.
 
 set -eu
 
@@ -21,20 +20,20 @@ HERE=$(cd "$(dirname "$0")/.." && pwd)
 cd "$HERE"
 
 APP="$HERE/build/DeepSeek Harness.app"
-VERSION=$(defaults read "$APP/Contents/Info" CFBundleShortVersionString 2>/dev/null || true)
+VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP/Contents/Info.plist" 2>/dev/null || true)
 [ -n "$VERSION" ] || {
 	echo "error: could not read the bundle version; run ./build.sh first" >&2
 	exit 1
 }
 
-ZIP="$HERE/build/dsh-mac-$VERSION.zip"
-STABLE="$HERE/build/dsh-mac.zip"
+DMG="$HERE/build/dsh-mac-$VERSION.dmg"
+STABLE="$HERE/build/dsh-mac.dmg"
 SUMS="$HERE/build/SHA256SUMS"
 
 echo "==> packaging DeepSeek Harness $VERSION"
 
-# The bundle has to be valid before it is worth packaging: a broken signature
-# here means a broken signature for everyone who downloads it.
+# The bundle has to be sound before it is worth distributing: a broken signature
+# here is a broken signature for everyone who downloads it.
 if ! codesign --verify --deep --strict "$APP" 2>/dev/null; then
 	echo "error: the built app does not have a valid signature" >&2
 	codesign --verify --verbose=4 "$APP" >&2 || true
@@ -42,51 +41,60 @@ if ! codesign --verify --deep --strict "$APP" 2>/dev/null; then
 fi
 echo "  [ ok ] signature verifies"
 
-# A macOS app must never be distributed carrying these.
-if xattr -lr "$APP" 2>/dev/null | grep -q "com.apple.quarantine"; then
+if xattr -r "$APP" 2>/dev/null | grep -q "com.apple.quarantine"; then
 	echo "error: the bundle carries a quarantine flag" >&2
 	exit 1
 fi
 echo "  [ ok ] no quarantine flag"
 
-rm -f "$ZIP" "$STABLE" "$SUMS"
+for stale in "$DMG" "$STABLE" "$SUMS"; do rm -f "$stale"; done
 
-# COPYFILE_DISABLE stops the resource forks being written at all; ditto is what
-# preserves symlinks and permissions inside the bundle.
-COPYFILE_DISABLE=1 /usr/bin/ditto -c -k --keepParent "$APP" "$ZIP"
+"$HERE/tools/make-dmg.sh" "$APP" "$DMG"
 
-# The stable name lets install.sh construct a download URL without knowing the
-# version, which is what the README one-liner relies on.
-cp "$ZIP" "$STABLE"
+# A stable name means a download URL does not have to know the version, which
+# is what the README one-liner relies on.
+cp "$DMG" "$STABLE"
 
-# Prove the round trip: unpack the way a user will and check that the signature
-# survived. This is the check that would have caught the v1.1 defect.
-CHECK=$(mktemp -d)
-trap 'rm -rf "$CHECK"' EXIT INT TERM
-/usr/bin/ditto -x -k "$ZIP" "$CHECK"
-UNPACKED="$CHECK/DeepSeek Harness.app"
+# ── prove the round trip ─────────────────────────────────────────────────────
+# Mount the image the way a user will and confirm the app inside is intact.
+
+MOUNT=$(mktemp -d)
+trap 'hdiutil detach "$MOUNT" >/dev/null 2>&1 || true; rm -rf "$MOUNT"' EXIT INT TERM
+
+hdiutil attach "$STABLE" -nobrowse -readonly -mountpoint "$MOUNT" >/dev/null
+
+UNPACKED="$MOUNT/DeepSeek Harness.app"
 if [ ! -d "$UNPACKED" ]; then
-	echo "error: the zip does not contain the app bundle" >&2
+	echo "error: the image does not contain the app bundle" >&2
 	exit 1
 fi
+
 if ! codesign --verify --deep --strict "$UNPACKED" 2>/dev/null; then
-	echo "error: the signature does not survive unpacking" >&2
+	echo "error: the signature does not survive the disk image" >&2
 	codesign --verify --verbose=4 "$UNPACKED" >&2 || true
 	exit 1
 fi
-if [ -n "$(find "$UNPACKED" -name '._*' -print -quit)" ]; then
-	echo "error: AppleDouble files were added to the bundle" >&2
+
+ADDED=$(find "$UNPACKED" \( -name '._*' -o -name '.DS_Store' \) -print -quit)
+if [ -n "$ADDED" ]; then
+	echo "error: extra files were added inside the bundle: $ADDED" >&2
 	exit 1
 fi
-echo "  [ ok ] signature survives unpacking"
+echo "  [ ok ] signature survives mounting, nothing added to the bundle"
 
-( cd "$HERE/build" && shasum -a 256 "dsh-mac-$VERSION.zip" "dsh-mac.zip" > SHA256SUMS )
+if [ ! -L "$MOUNT/Applications" ]; then
+	echo "error: the image has no Applications shortcut" >&2
+	exit 1
+fi
+echo "  [ ok ] includes an Applications shortcut"
+
+( cd "$HERE/build" && shasum -a 256 "dsh-mac-$VERSION.dmg" "dsh-mac.dmg" > SHA256SUMS )
 
 echo
 echo "──────────────────────────────────────────"
 echo "assets ready in build/, upload all three to the release:"
-echo "  $ZIP"
+echo "  $DMG"
 echo "  $STABLE"
 echo "  $SUMS"
 echo
-cat "$SUMS" | sed 's/^/  /'
+sed 's/^/  /' "$SUMS"
