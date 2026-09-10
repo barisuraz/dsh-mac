@@ -35,6 +35,13 @@ jobs:
         run: |
           "build/DeepSeek Harness.app/Contents/MacOS/DeepSeekHarness" --test-parser
 
+      - name: Run the A/B update and crash-loop tests
+        run: |
+          "build/DeepSeek Harness.app/Contents/MacOS/DeepSeekHarness" --test-update
+
+      - name: Run the end-to-end recovery tests
+        run: ./tools/test-ab.sh
+
       - name: Install DSH and verify the end-to-end contract
         run: |
           npm install -g @deepseek-ai/dsh

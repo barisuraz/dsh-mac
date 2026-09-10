@@ -6,3 +6,10 @@ build/
 # Diagnostics and local test state
 *.log
 .checkhome/
+
+# Scratch trees used when testing the update and recovery paths by hand
+.abtest/
+.abtest-home/
+.crashtest/
+.e2e/
+.e2e-home/

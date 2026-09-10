@@ -1,35 +1,22 @@
 # dsh-mac
 
-A native macOS window for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) — the real DSH web UI, in its own app, with no browser involved.
+A native macOS window for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). It runs the real DSH web UI in its own app, so your coding agent does not share a browser profile, session, or keyboard-shortcut namespace with your personal browsing.
 
-The app starts `dsh web` for you, waits for it to listen, shows the GUI in a `WKWebView`, and stops the server when you quit.
+The app starts `dsh web`, waits for it to listen, shows the GUI in a `WKWebView`, and stops the server when you quit.
 
-```
-┌──────────────────────────────┐
-│ ● ● ●      DeepSeek Harness  │
-├──────────────────────────────┤
-│                              │
-│   the real DSH web GUI       │
-│   in a native window         │
-│                              │
-└──────────────────────────────┘
-```
+## What this is
 
-## Why this exists
+One Swift file. It is a shell, not a fork: it implements no harness logic, reimplements no UI, and reads no DSH config, API, or plugin interface. Everything in the window is upstream DSH.
 
-DSH already ships a complete agent runtime and web UI. What it does not ship is a way to run that UI as an app: you start a server in a terminal, then open a browser tab, and now your coding agent shares a profile, a session, and a keyboard-shortcut namespace with your personal browsing.
-
-`dsh-mac` is one Swift file of about 1000 lines that closes that gap. It is a **shell, not a fork**: it implements no harness logic, reimplements no UI, and reads no DSH config, API, or plugin interface. Everything you see in the window is upstream DSH.
-
-## What it is not
-
-It is not a chat client. It does not talk to any model API itself, store your conversations, or manage credentials. It launches the harness you already have and displays it.
+It is not a chat client. It does not call any model API, store conversations, or manage credentials. It launches a harness and displays it.
 
 ## Requirements
 
 - macOS 13 or later
 - The Xcode Command Line Tools (`xcode-select --install`)
-- DSH installed and working: `npm i -g @deepseek-ai/dsh`
+- Node and npm, to fetch the harness
+
+You do **not** need DSH installed beforehand. If you have it, the first launch uses your copy immediately; if you do not, the app fetches one.
 
 ## Install
 
@@ -40,34 +27,73 @@ cd dsh-mac
 open "build/DeepSeek Harness.app"
 ```
 
-`build.sh` needs no network access and downloads nothing. To keep it in your Applications folder:
+`build.sh` downloads nothing. To keep it in your Applications folder:
 
 ```sh
 cp -R "build/DeepSeek Harness.app" /Applications/
 ```
 
-The app is ad-hoc signed, so the first launch from Finder may ask for confirmation. Built locally by you, that is expected.
+The app is ad-hoc signed rather than notarized, so a downloaded copy is quarantined by macOS. Either build it yourself as above, or clear the flag once:
+
+```sh
+xattr -dr com.apple.quarantine "/Applications/DeepSeek Harness.app"
+```
+
+## Updates
+
+DSH is in developer preview and changes constantly, so the app updates it for you on every launch. It does that the way Android does A/B system updates: two copies are kept, an update only ever lands in the idle one, and the running copy is never modified.
+
+```
+        ┌───────────────┐         ┌───────────────┐
+        │    slot a     │         │    slot b     │
+        │  running now  │         │   fallback    │
+        └───────────────┘         └───────────────┘
+                 ▲                        ▲
+     boots from here            new version is
+     and keeps working          installed here
+```
+
+On launch:
+
+1. The app boots the preferred slot and shows your GUI. This does not wait for any download.
+2. Once the running version has stayed up for a minute, the newest release is installed into the other slot.
+3. That copy is started on a throwaway port and must serve the UI before it is trusted. Only then is it marked ready.
+4. On the next launch it becomes the running version, and the version it replaced stays as the fallback.
+
+If the new version turns out to be bad, the app recovers on its own and tells you:
+
+- **It will not start.** The startup check catches it before it ever becomes your running version, and it is discarded.
+- **It starts and then keeps dying.** A version that served and then stopped within a minute is counted as an early exit. Three of those and the app stops retrying, marks that version broken, and switches back to the other slot.
+
+Either way you get a banner naming the version that failed, the version you are now running, and why. Nothing is deleted behind your back: the slot that failed is kept and marked, and a version that failed to start is not downloaded again. `Check for Harness Updates` (`⌘U`) clears that verdict and retries; `Reinstall Harness…` rebuilds the idle slot from scratch.
+
+Two copies of the harness take roughly 600 MB, plus an npm cache the app keeps to itself in `~/Library/Application Support/DeepSeekHarness`. Your own npm cache is never touched.
 
 ## Behaviour worth knowing
 
-**It manages its own server.** Launching the app starts `dsh web --no-open`; quitting stops it. A `dsh` you started yourself is never touched.
+**Your existing harness is left alone.** If port `3080` is already taken, the app asks the OS for a free port instead of fighting over it.
 
-**Your existing harness is left alone.** If port `3080` is already taken, the app asks the OS for a free port instead of fighting over it or showing an error.
-
-**Nothing outlives the app.** The server is started under a small supervisor that shuts it down even if the app is force-killed, so you will not find an orphaned `node` process holding a port.
+**Nothing outlives the app.** The server runs under a small supervisor that shuts it down even if the app is force-killed, so you will not find an orphaned `node` process holding a port.
 
 **Its storage is its own.** The webview uses the app's own container, so cookies and local storage never mix with Chrome, Safari, or any other browser profile.
 
-**It fails visibly.** If the harness cannot start, the window shows the reason and the last lines of the harness's own output instead of a blank page. The same text is appended to `~/Library/Logs/DeepSeekHarness/wrapper.log`.
+**Your sessions carry over.** The app uses the same `~/.dsh` as the command line, so existing sessions, workspaces, and credentials appear with no migration.
+
+**It fails visibly.** If the harness cannot start, the window shows the reason and the last lines of the harness's own output rather than a blank page. The same text goes to `~/Library/Logs/DeepSeekHarness/wrapper.log`.
 
 ## Configuration
 
-Both are optional and read from the environment, so launch from a terminal to use them:
+All optional, read from the environment, so launch from a terminal to use them.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `DSH_WRAPPER_PORT` | `3080` | Port to prefer; falls back to an OS-assigned port if busy. |
-| `DSH_BIN` | auto-detected | Explicit path to the `dsh` executable. |
+| `DSH_MANAGED` | `1` | Set to `0` to skip slots and updates entirely and use whatever `dsh` resolves to. |
+| `DSH_NO_AUTO_UPDATE` | `0` | Set to `1` to keep slots but never fetch anything on launch. |
+| `DSH_SLOT_VERSION` | newest | Pin slots to a specific version instead of tracking the newest. |
+| `DSH_BIN` | auto-detected | Explicit path to a `dsh` executable. |
+| `DSH_NPM_BIN` | auto-detected | Explicit path to `npm`. |
+| `DSH_APP_SUPPORT` | `~/Library/Application Support/DeepSeekHarness` | Where slots and update state live. |
 | `DSH_WRAPPER_LOG` | `~/Library/Logs/DeepSeekHarness/wrapper.log` | Where to write diagnostics. |
 
 `DSH_HOME` and the rest of your DSH environment are inherited unchanged.
@@ -78,59 +104,75 @@ Both are optional and read from the environment, so launch from a terminal to us
 | --- | --- |
 | `⌘R` | Reload the GUI |
 | `⇧⌘R` | Restart the harness |
+| `⌘U` | Check for Harness updates |
 | `⌘+` / `⌘-` / `⌘0` | Zoom |
 | `⌘Q` | Quit and stop the harness |
 
 ## Maintenance
 
-The honest risk with any wrapper is that upstream moves and the wrapper rots. So this one keeps its coupling to a single, explicitly tested contract:
+The real risk with any wrapper is that upstream moves and the wrapper rots. This one keeps its coupling to a single contract:
 
 > 1. a `dsh` executable can be resolved,
 > 2. `dsh web --no-open --port N` serves the GUI on loopback,
 > 3. it prints a loopback URL carrying a `token` parameter.
 
-That is the whole of it. The app reads no DSH config, API, or plugin interface, which is deliberate: the process boundary is the most stable seam DSH offers, and it is why a native shell needs less upkeep than a plugin or a fork would.
+That is all of it. Keeping the coupling at the process boundary is deliberate; it is the most stable seam DSH offers, and it is why a shell needs less upkeep than a plugin or a fork.
 
-Because claim 3 is a log line rather than a documented interface, it is the part most likely to change. Two things guard it:
+Claim 3 is a log line rather than a documented interface, so it is the part most likely to change. Two things guard it:
 
-- The parser accepts a reworded line, needing only *some* loopback URL carrying a token — not an exact prefix.
-- `--test-parser` and `--check-contract` fail loudly when upstream drifts, and CI runs both on every push and weekly.
+- The parser accepts a reworded line, needing only *some* loopback URL carrying a token, not an exact prefix.
+- `--test-parser` and `--check-contract` fail loudly when upstream drifts. CI runs both on every push and weekly.
 
-If upstream changes something, the failure is a red build naming the claim that broke, not a user staring at a window that never loads.
+If upstream changes something, you get a red build naming the claim that broke instead of a window that never loads.
+
+Because the window renders upstream's own frontend, new harness features appear in the app as soon as they ship. The app has nothing to reimplement and therefore nothing to fall behind on.
+
+### Diagnostics
 
 ```sh
-# what the app resolved, without opening a window
-"build/DeepSeek Harness.app/Contents/MacOS/DeepSeekHarness" --selftest
+APP="build/DeepSeek Harness.app/Contents/MacOS/DeepSeekHarness"
 
-# readiness-line parser, including the cases it must refuse
-"build/DeepSeek Harness.app/Contents/MacOS/DeepSeekHarness" --test-parser
+# what the app resolved, without opening a window
+"$APP" --selftest
+
+# the readiness-line parser, including the cases it must refuse
+"$APP" --test-parser
+
+# A/B slot bookkeeping and crash-loop detection
+"$APP" --test-update
 
 # starts a real harness and verifies the full contract
-"build/DeepSeek Harness.app/Contents/MacOS/DeepSeekHarness" --check-contract
+"$APP" --check-contract
+
+# end-to-end recovery: drives the app against deliberately broken harnesses
+./tools/test-ab.sh
 ```
 
 ## Security notes
 
-The harness web server runs local code execution behind a loopback URL. This app is built to respect that boundary:
+The harness server runs local code execution behind a loopback URL. The app respects that boundary:
 
 - Only `http` URLs on `127.0.0.1` or `localhost` carrying a `token` parameter are ever loaded. The parser is tested against non-loopback and non-http input.
-- The token is read from the harness's own output and used once to load the GUI; it is redacted from all diagnostic output.
+- The token is read from the harness's own output and used once to load the GUI. It is redacted from all diagnostic output.
 - DSH refuses to bind `0.0.0.0`, and this app does not change that.
 - Links to other sites open in your default browser rather than inside the harness window.
+- Installs run `npm install` with the app's own cache directory. Nothing is installed globally and no shell profile is modified.
 - DSH is in developer preview. Review anything you run against your own machine.
 
 ## Project layout
 
 ```
-Sources/main.swift          the entire app: window, launcher, supervisor, diagnostics
+Sources/main.swift          the entire app: window, launcher, supervisor, slots, diagnostics
 tools/make-icon.swift       the icon, drawn as vectors at each required size
 tools/deepseek-whale.path   the whale outline, taken from DSH's own frontend asset
+tools/test-ab.sh            end-to-end update and recovery tests
 build.sh                    compiles, assembles, icons, and signs the bundle
 Info.plist                  bundle metadata
+.github/workflows/ci.yml    build, contract check, and both test suites
 ```
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).
 
-The app icon uses the DeepSeek whale mark, and the outline is parsed from the same vector asset DSH ships in its own web frontend. The mark belongs to DeepSeek; it is used here only to identify what the app runs. Remove or replace it if you redistribute this under a different name. This project is not affiliated with or endorsed by DeepSeek.
+The app icon uses the DeepSeek whale mark, parsed from the same vector asset DSH ships in its web frontend. The mark belongs to DeepSeek and is used here only to identify what the app runs. Replace it if you redistribute this under a different name. This project is not affiliated with or endorsed by DeepSeek.
