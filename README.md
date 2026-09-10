@@ -67,7 +67,7 @@ If the new version turns out to be bad, the app recovers on its own and tells yo
 - **It will not start.** The startup check catches it before it ever becomes your running version, and it is discarded.
 - **It starts and then keeps dying.** A version that served and then stopped within a minute is counted as an early exit. Three of those and the app stops retrying, marks that version broken, and switches back to the other slot.
 
-Either way you get a banner naming the version that failed, the version you are now running, and why. Nothing is deleted behind your back: the slot that failed is kept and marked, and a version that failed to start is not downloaded again. `Check for Harness Updates` (`⌘U`) clears that verdict and retries; `Reinstall Harness…` rebuilds the idle slot from scratch.
+Either way a card appears at the top-right naming the version that failed, the version you are now running, and why. It stays until you dismiss it; ordinary progress notices fade on their own. Nothing is deleted behind your back: the slot that failed is kept and marked, and a version that failed to start is not downloaded again. `Check for Harness Updates` (`⌘U`) clears that verdict and retries; `Reinstall Harness…` rebuilds the idle slot from scratch.
 
 Two copies of the harness take roughly 600 MB, plus an npm cache the app keeps to itself in `~/Library/Application Support/DeepSeekHarness`. Your own npm cache is never touched.
 
@@ -147,6 +147,9 @@ APP="build/DeepSeek Harness.app/Contents/MacOS/DeepSeekHarness"
 
 # A/B slot bookkeeping and crash-loop detection
 "$APP" --test-update
+
+# how the in-app notice card renders
+"$APP" --test-notice
 
 # fetch and verify a harness into a slot, without opening a window
 "$APP" --install-harness

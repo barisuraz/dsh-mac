@@ -1112,6 +1112,129 @@ final class HarnessServer {
     }
 }
 
+// MARK: - Notice card
+
+/// A small floating card reporting something about the app itself: an update
+/// that is ready, or a version that was rolled back.
+///
+/// Deliberately a card and not a full-width bar. The window is showing the
+/// harness's own UI, and an opaque strip across the top of it would cover that
+/// UI's header while looking like part of it. It is also fully opaque: a
+/// translucent notice over live content is hardest to read for exactly the
+/// messages that matter most.
+final class NoticeCard: NSView {
+    enum Kind {
+        case info
+        case warning
+
+        var accent: NSColor {
+            switch self {
+            case .info: return .systemBlue
+            case .warning: return .systemOrange
+            }
+        }
+
+        var symbol: String {
+            switch self {
+            case .info: return "arrow.down.circle.fill"
+            case .warning: return "exclamationmark.triangle.fill"
+            }
+        }
+    }
+
+    let kind: Kind
+    /// Called when the user dismisses the card, so the owner can clear it.
+    var onDismiss: (() -> Void)?
+
+    /// Widest the card grows before its text wraps.
+    static let maximumWidth: CGFloat = 460
+
+    private let closeButton = NSButton()
+    private let iconView = NSImageView()
+
+    init(kind: Kind, title: String, detail: String) {
+        self.kind = kind
+        super.init(frame: .zero)
+
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        // An opaque, adaptive background: controlBackgroundColor tracks light
+        // and dark mode and hides whatever the window is showing underneath.
+        layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
+        layer?.cornerRadius = 10
+        layer?.borderWidth = 1
+        layer?.borderColor = NSColor.separatorColor.cgColor
+        // The shadow needs an unclipped layer. Nothing is drawn outside the
+        // card's bounds, so the rounded background still reads correctly.
+        layer?.masksToBounds = false
+        layer?.shadowColor = NSColor.black.cgColor
+        layer?.shadowOpacity = 0.30
+        layer?.shadowRadius = 14
+        layer?.shadowOffset = CGSize(width: 0, height: -3)
+
+        iconView.image = NSImage(systemSymbolName: kind.symbol, accessibilityDescription: nil)
+        iconView.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 15, weight: .semibold)
+        iconView.contentTintColor = kind.accent
+        iconView.imageScaling = .scaleProportionallyUpOrDown
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+        iconView.setContentHuggingPriority(.required, for: .horizontal)
+        iconView.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        let titleLabel = NSTextField(labelWithString: title)
+        titleLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+        titleLabel.textColor = .labelColor
+        titleLabel.lineBreakMode = .byWordWrapping
+        titleLabel.maximumNumberOfLines = 3
+        titleLabel.preferredMaxLayoutWidth = Self.maximumWidth - 78
+
+        let detailLabel = NSTextField(wrappingLabelWithString: detail)
+        detailLabel.font = .systemFont(ofSize: 11)
+        detailLabel.textColor = .secondaryLabelColor
+        detailLabel.maximumNumberOfLines = 6
+        detailLabel.preferredMaxLayoutWidth = Self.maximumWidth - 78
+
+        let text = NSStackView(views: [titleLabel, detailLabel])
+        text.orientation = .vertical
+        text.alignment = .leading
+        text.spacing = 3
+        text.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        text.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        closeButton.image = NSImage(systemSymbolName: "xmark", accessibilityDescription: "Dismiss")
+        closeButton.isBordered = false
+        closeButton.contentTintColor = .secondaryLabelColor
+        closeButton.target = self
+        closeButton.action = #selector(closeTapped)
+        closeButton.translatesAutoresizingMaskIntoConstraints = false
+        closeButton.setContentHuggingPriority(.required, for: .horizontal)
+        closeButton.toolTip = "Dismiss"
+
+        let row = NSStackView(views: [iconView, text, closeButton])
+        row.orientation = .horizontal
+        row.alignment = .top
+        row.spacing = 10
+        row.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(row)
+
+        NSLayoutConstraint.activate([
+            row.topAnchor.constraint(equalTo: topAnchor, constant: 11),
+            row.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -11),
+            row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            row.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -9),
+
+            iconView.widthAnchor.constraint(equalToConstant: 17),
+            iconView.heightAnchor.constraint(equalToConstant: 17),
+            closeButton.widthAnchor.constraint(equalToConstant: 15),
+            closeButton.heightAnchor.constraint(equalToConstant: 15),
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    @objc private func closeTapped() { onDismiss?() }
+}
+
 // MARK: - Status overlay
 
 /// Shown while the server starts, and again if it fails. Replaces the browser's
@@ -1213,7 +1336,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     private var updateWorkItem: DispatchWorkItem?
     private let managed = ManagedInstall()
     /// The floating notice currently on screen, if any.
-    private var banner: NSView?
+    private var banner: NoticeCard?
+    /// Pending auto-dismiss for an informational notice.
+    private var bannerDismissWork: DispatchWorkItem?
 
     private var preferredPort: Int {
         let raw = ProcessInfo.processInfo.environment["DSH_WRAPPER_PORT"] ?? ""
@@ -1276,6 +1401,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         overlay.retryButton.action = #selector(retryStartup)
 
         let content = NSView()
+        // Layer-backed so the notice card composites reliably above the
+        // webview, which draws in its own layer.
+        content.wantsLayer = true
         content.addSubview(webView)
         content.addSubview(overlay)
         NSLayoutConstraint.activate([
@@ -1592,114 +1720,90 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
 
     // MARK: Alerts
 
-    enum BannerKind { case info, warning }
-
-    /// A floating notice across the top of the window.
+    /// Put a notice card at the top-right of the window.
     ///
-    /// Deliberately not a modal: an update problem must not stop the user from
-    /// working, so the message sits above the GUI, explains itself, and can be
-    /// dismissed. It is the only place the user is told that a rollback
-    /// happened, so it carries the reason, not just the fact.
-    private func showBanner(_ message: String, detail: String, kind: BannerKind) {
+    /// Deliberately not modal: an update problem must not stop the user from
+    /// working. It is the only place a rollback is reported, so a warning stays
+    /// until dismissed; an informational notice fades on its own, because it is
+    /// reassurance rather than something to act on.
+    private func showBanner(_ message: String, detail: String, kind: NoticeCard.Kind) {
         dismissBanner()
         guard let content = window.contentView else { return }
 
-        let tint: NSColor = kind == .warning ? .systemOrange : .systemBlue
-        let bar = NSView()
-        bar.translatesAutoresizingMaskIntoConstraints = false
-        bar.wantsLayer = true
-        bar.layer?.backgroundColor = tint.withAlphaComponent(0.16).cgColor
-        bar.layer?.borderColor = tint.withAlphaComponent(0.40).cgColor
-        bar.layer?.borderWidth = 1
-        bar.layer?.cornerRadius = 8
+        let card = NoticeCard(kind: kind, title: message, detail: detail)
+        card.alphaValue = 0
+        card.onDismiss = { [weak self] in self?.dismissBanner() }
 
-        let title = NSTextField(labelWithString: message)
-        title.font = .systemFont(ofSize: 12, weight: .semibold)
-        title.lineBreakMode = .byWordWrapping
-        title.maximumNumberOfLines = 2
-
-        let body = NSTextField(wrappingLabelWithString: detail)
-        body.font = .systemFont(ofSize: 11)
-        body.textColor = .secondaryLabelColor
-        body.maximumNumberOfLines = 5
-
-        let text = NSStackView(views: [title, body])
-        text.orientation = .vertical
-        text.alignment = .leading
-        text.spacing = 2
-
-        let dismiss = NSButton(title: "Dismiss", target: self, action: #selector(dismissBannerAction))
-        dismiss.bezelStyle = .rounded
-        dismiss.controlSize = .small
-
-        let row = NSStackView(views: [text, dismiss])
-        row.orientation = .horizontal
-        row.alignment = .centerY
-        row.spacing = 16
-        row.translatesAutoresizingMaskIntoConstraints = false
-        bar.addSubview(row)
-
+        // Placed above everything explicitly. The window hosts a WKWebView, and
+        // insertion order alone is not something to rely on for a view that has
+        // to be visible over it.
+        content.addSubview(card, positioned: .above, relativeTo: nil)
         NSLayoutConstraint.activate([
-            row.topAnchor.constraint(equalTo: bar.topAnchor, constant: 10),
-            row.bottomAnchor.constraint(equalTo: bar.bottomAnchor, constant: -10),
-            row.leadingAnchor.constraint(equalTo: bar.leadingAnchor, constant: 14),
-            row.trailingAnchor.constraint(equalTo: bar.trailingAnchor, constant: -14),
+            card.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
+            card.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
+            card.widthAnchor.constraint(lessThanOrEqualToConstant: NoticeCard.maximumWidth),
+            card.leadingAnchor.constraint(greaterThanOrEqualTo: content.leadingAnchor, constant: 12),
         ])
+        banner = card
 
-        content.addSubview(bar)
-        NSLayoutConstraint.activate([
-            bar.topAnchor.constraint(equalTo: content.topAnchor, constant: 10),
-            bar.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 10),
-            bar.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -10),
-        ])
-        banner = bar
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.18
+            card.animator().alphaValue = 1
+        }
+
+        guard kind == .info else { return }
+        // Long enough to read, short enough not to linger over the harness UI.
+        let work = DispatchWorkItem { [weak self] in self?.dismissBanner() }
+        bannerDismissWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8, execute: work)
     }
 
-    @objc private func dismissBannerAction() { dismissBanner() }
-
     private func dismissBanner() {
-        banner?.removeFromSuperview()
+        bannerDismissWork?.cancel()
+        bannerDismissWork = nil
+        guard let card = banner else { return }
         banner = nil
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.15
+            card.animator().alphaValue = 0
+        } completionHandler: {
+            card.removeFromSuperview()
+        }
     }
 
     /// Tell the user, in plain words, that the update did not work and that the
     /// previous version is running.
+    ///
+    /// The card stays readable on purpose: it says what happened and what the
+    /// app did about it. The harness's own error text goes to the log instead,
+    /// where it is useful for diagnosis and unreadable as a notification.
     private func alertRollback(
         failed: String, recovered: String, reason: String, cause: RollbackCause
     ) {
-        let firstLine = reason
-            .split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
-            .first.map(String.init) ?? reason
-
         let headline: String
         let explanation: String
         switch cause {
         case .failedToStart:
-            headline = "The updated Harness (\(failed)) did not start — running \(recovered) instead"
+            headline = "Harness \(failed) did not start — back on \(recovered)"
             explanation = "It never began serving the interface, so the app switched back automatically."
         case .crashLoop:
-            headline = "The updated Harness (\(failed)) kept quitting — running \(recovered) instead"
+            headline = "Harness \(failed) kept quitting — back on \(recovered)"
             explanation = """
                 It started and then stopped \(ManagedInstall.crashLoopLimit) times in a row, so the app \
-                switched back automatically rather than keep restarting it.
+                switched back rather than keep restarting it.
                 """
         }
 
         showBanner(
             headline,
-            detail: """
-                \(explanation)
-                \(firstLine)
-                \(recovered) stays as the fallback and \(failed) will not be tried again. \
-                Details are in the log.
-                """,
+            detail: "\(explanation) \(failed) will not be tried again. See the log for details.",
             kind: .warning)
     }
 
     private func reportUpdateStaged(_ version: String) {
         showBanner(
             "Harness \(version) is ready",
-            detail: "It installed and passed a startup check. It will be used the next time this app launches.",
+            detail: "Verified and waiting. It will be used the next time this app launches.",
             kind: .info)
     }
 
@@ -2146,6 +2250,129 @@ enum UpdateTests {    static func run() -> Never {
     }
 }
 
+/// Tests for the notice card's appearance.
+///
+/// The card exists to be read over the harness's own UI, so "does it look
+/// right" is a real requirement rather than a matter of taste: if its
+/// background is translucent, the harness shows through and the message that
+/// matters most becomes the hardest to read. These render the card offscreen
+/// and inspect the pixels, so that property is checked rather than assumed.
+enum NoticeTests {
+    static func run() -> Never {
+        // AppKit needs an application instance before any view can be drawn.
+        _ = NSApplication.shared
+        var failures = 0
+
+        func check(_ condition: Bool, _ label: String) {
+            print(condition ? "  [ ok ] \(label)" : "  [FAIL] \(label)")
+            if !condition { failures += 1 }
+        }
+
+        print("notice card tests")
+
+        /// Render a card and hand back its pixels, or nil when this environment
+        /// has no window server to draw into.
+        func render(kind: NoticeCard.Kind, title: String, detail: String) -> NSBitmapImageRep? {
+            let card = NoticeCard(kind: kind, title: title, detail: detail)
+            card.layoutSubtreeIfNeeded()
+            let size = card.fittingSize
+            guard size.width > 1, size.height > 1 else { return nil }
+            card.frame = NSRect(origin: .zero, size: size)
+            card.layoutSubtreeIfNeeded()
+            guard let rep = card.bitmapImageRepForCachingDisplay(in: card.bounds) else { return nil }
+            card.cacheDisplay(in: card.bounds, to: rep)
+            return rep
+        }
+
+        let warning = render(
+            kind: .warning, title: "Harness 0.1.6 did not start",
+            detail: "Running 0.1.5 instead. It will not be tried again.")
+        let info = render(
+            kind: .info, title: "Harness 0.1.5 is ready",
+            detail: "It will be used the next time this app launches.")
+
+        // Optional: write the cards out so a human can look at them.
+        if let directory = ProcessInfo.processInfo.environment["DSH_NOTICE_DUMP"], !directory.isEmpty {
+            for (name, rep) in [("warning", warning), ("info", info)] {
+                if let rep, let png = rep.representation(using: .png, properties: [:]) {
+                    let url = URL(fileURLWithPath: directory).appendingPathComponent("notice-\(name).png")
+                    try? png.write(to: url)
+                    print("  wrote \(url.path)")
+                }
+            }
+        }
+
+        guard let warning, let info else {
+            print("  [skip] could not render a view here, so no pixels were checked")
+            exit(0)
+        }
+
+        func pixel(_ rep: NSBitmapImageRep, _ x: Int, _ y: Int) -> NSColor? {
+            rep.colorAt(x: x, y: y)?.usingColorSpace(.sRGB)
+        }
+
+        // A fully transparent centre means this environment produced an empty
+        // bitmap rather than a real drawing; treat that as "cannot test here"
+        // instead of reporting a false failure.
+        let centre = pixel(warning, warning.pixelsWide / 2, warning.pixelsHigh / 2)
+        guard let centre, centre.alphaComponent > 0.9 else {
+            print("  [skip] no window server; the card rendered blank")
+            exit(0)
+        }
+
+        check(true, "the card renders")
+        check(warning.pixelsWide > 150, "the card has a real width (\(warning.pixelsWide)px)")
+
+        // Opaque: the whole point is that the harness UI cannot show through.
+        var translucent = 0
+        var sampled = 0
+        for x in stride(from: 20, to: warning.pixelsWide - 20, by: 7) {
+            for y in stride(from: 8, to: warning.pixelsHigh - 8, by: 5) {
+                sampled += 1
+                if let c = pixel(warning, x, y), c.alphaComponent < 0.99 { translucent += 1 }
+            }
+        }
+        check(sampled > 0 && translucent == 0, "the card is fully opaque (\(translucent)/\(sampled) see-through)")
+
+        // Rounded: the very corner falls outside the rounded background.
+        let corner = pixel(warning, 0, 0)
+        check((corner?.alphaComponent ?? 1) < 0.5, "the card has rounded corners")
+
+        /// Count pixels matching a hue, used to prove the two kinds are
+        /// visually distinguishable rather than only differing in text.
+        func count(_ rep: NSBitmapImageRep, _ matches: (NSColor) -> Bool) -> Int {
+            var total = 0
+            for x in 0..<rep.pixelsWide {
+                for y in 0..<rep.pixelsHigh {
+                    if let c = pixel(rep, x, y), c.alphaComponent > 0.5, matches(c) { total += 1 }
+                }
+            }
+            return total
+        }
+
+        let isOrange: (NSColor) -> Bool = { c in
+            c.redComponent > 0.75 && c.greenComponent > 0.25 && c.greenComponent < 0.78
+                && c.blueComponent < 0.35
+        }
+        let isBlue: (NSColor) -> Bool = { c in
+            c.blueComponent > 0.65 && c.redComponent < 0.5 && c.greenComponent < 0.75
+        }
+
+        check(count(warning, isOrange) > 20, "a warning is marked in orange")
+        check(count(info, isBlue) > 20, "an informational notice is marked in blue")
+        check(
+            count(warning, isBlue) < count(info, isBlue) || count(warning, isOrange) > count(info, isOrange),
+            "the two kinds are visually distinct")
+
+        if failures == 0 {
+            print("all notice card tests passed")
+            exit(0)
+        }
+        print("\(failures) notice card test(s) failed")
+        exit(1)
+    }
+}
+
 /// Tests for {@link HarnessServer.readyURL}, the single piece of harness output
 /// this app interprets. These run in CI so that a change to that log line fails
 /// loudly here, rather than silently in someone's window.
@@ -2258,6 +2485,10 @@ if arguments.contains("--test-update") {
 
 if arguments.contains("--install-harness") {
     InstallHarness.run()
+}
+
+if arguments.contains("--test-notice") {
+    NoticeTests.run()
 }
 
 if arguments.contains("--check-contract") {
