@@ -56,8 +56,9 @@ jobs:
 
       - name: Verify the installer against the packaged disk image
         run: |
-          # Serve the local build over HTTP so install.sh can be exercised
-          # without publishing a release, by pointing it at a file URL.
+          # DSH_SOURCE_DIR makes install.sh use the image built above instead
+          # of downloading a release, so the whole install path is exercised
+          # without publishing anything.
           DSH_INSTALL_DIR="$RUNNER_TEMP/install-target" \
           DSH_NO_OPEN=1 \
           DSH_SOURCE_DIR="$PWD/build" \

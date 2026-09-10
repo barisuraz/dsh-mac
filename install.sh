@@ -163,6 +163,12 @@ fi
 
 # --- install ----------------------------------------------------------------
 
+# A directory that does not exist is not writable, so create it first: pointing
+# DSH_INSTALL_DIR at a fresh path is a reasonable thing to do.
+if [ ! -d "$INSTALL_DIR" ]; then
+    mkdir -p "$INSTALL_DIR" 2>/dev/null || die "could not create $INSTALL_DIR"
+fi
+
 if [ ! -w "$INSTALL_DIR" ]; then
     die "$INSTALL_DIR is not writable. Re-run with sudo, or set DSH_INSTALL_DIR to somewhere you own."
 fi

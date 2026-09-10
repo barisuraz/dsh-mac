@@ -27,3 +27,5 @@ build/
 .sig/
 .rel/
 .dmgtest/
+.ghcache/
+.fresh-target/
