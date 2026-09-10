@@ -42,6 +42,22 @@ jobs:
       - name: Run the end-to-end recovery tests
         run: ./tools/test-ab.sh
 
+      - name: Verify first-run provisioning installs a harness into a slot
+        run: |
+          # No harness on PATH, no existing slots: the app must fetch and verify
+          # one. This is the path a brand new machine takes.
+          DSH_NO_SYSTEM_DSH=1 \
+          DSH_APP_SUPPORT="$RUNNER_TEMP/dsh-app" \
+          DSH_HOME="$RUNNER_TEMP/dsh-home" \
+            "build/DeepSeek Harness.app/Contents/MacOS/DeepSeekHarness" --install-harness
+
+      - name: Verify the release signing path
+        run: |
+          # The hardened runtime is what notarization requires, so a local
+          # release build must carry it even when ad-hoc signed.
+          codesign -dv --verbose=4 "build/DeepSeek Harness.app" 2>&1 | grep -q "runtime" \
+            || { echo "hardened runtime is not enabled"; exit 1; }
+
       - name: Install DSH and verify the end-to-end contract
         run: |
           npm install -g @deepseek-ai/dsh

@@ -72,12 +72,44 @@ final class Log {
 // MARK: - Locating the harness
 
 enum Locator {
+    /// Read a boolean-ish environment variable.
+    static func flag(_ name: String, default defaultValue: Bool = false) -> Bool {
+        guard let raw = ProcessInfo.processInfo.environment[name] else { return defaultValue }
+        return ["1", "true", "yes", "on"].contains(raw.lowercased())
+    }
+
+    /// Condense a multi-line failure report into one useful line: the headline
+    /// plus the tail of the harness's own output.
+    ///
+    /// Truncating from the front loses the actual error, which is always at the
+    /// end of a Node stack trace, so the tail is what matters.
+    static func condense(_ reason: String, limit: Int = 400) -> String {
+        let lines = reason
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        guard let headline = lines.first else { return "" }
+        // Drop the trailing "at ..." frames; the message line is above them.
+        let body = lines.dropFirst().filter { !$0.hasPrefix("at ") }
+        let tail = body.suffix(3).joined(separator: " / ")
+        let combined = tail.isEmpty ? headline : "\(headline) — \(tail)"
+        return String(combined.prefix(limit))
+    }
+
+    /// `DSH_NO_SYSTEM_DSH=1` makes the app ignore any harness on `PATH` and use
+    /// only its own managed slots, so what it runs does not depend on your shell
+    /// setup. An explicit `DSH_BIN` still wins, being a deliberate override.
+    static var ignoresSystemDsh: Bool { flag("DSH_NO_SYSTEM_DSH") }
+
     /// Resolve the `dsh` launcher the way the user's own shell would.
     ///
     /// A Finder-launched bundle has a bare `PATH`, so a plain PATH lookup is not
     /// enough: the login+interactive shell reproduces the terminal environment,
     /// and the `npx` cache glob covers the common `npx @deepseek-ai/dsh` install
     /// even when no shell profile puts it on `PATH`.
+    ///
+    /// Returns nil when nothing is installed anywhere, which is the signal to
+    /// provision a managed copy.
     static func dshPath() -> String? {
         let fm = FileManager.default
         let env = ProcessInfo.processInfo.environment
@@ -85,6 +117,11 @@ enum Locator {
         if let override = env["DSH_BIN"], !override.isEmpty, fm.isExecutableFile(atPath: override) {
             Log.shared.write("dsh: using DSH_BIN override \(override)")
             return override
+        }
+
+        if ignoresSystemDsh {
+            Log.shared.write("dsh: ignoring harnesses on PATH (DSH_NO_SYSTEM_DSH=1)")
+            return nil
         }
 
         if let out = runShell("command -v dsh") {
@@ -765,7 +802,10 @@ final class ManagedInstall {
 
         guard let url = ready else {
             server.stop()
-            return failure.map { String($0.prefix(200)) } ?? "no listening port within \(Int(timeout))s"
+            // Keep the tail of the output: that is where Node puts the actual
+            // error, and it is what makes a failed update diagnosable.
+            return Locator.condense(
+                failure ?? "no listening port within \(Int(timeout))s")
         }
 
         var status: Int?
@@ -1902,11 +1942,66 @@ enum ContractCheck {
     }
 }
 
+/// Provision a managed harness copy without opening a window.
+///
+/// This is the same work the first launch does when no harness is installed at
+/// all, exposed so it can be run headlessly: to pre-fetch the harness, to repair
+/// an install, or to set a machine up before anyone signs in to the GUI.
+enum InstallHarness {
+    static func run() -> Never {
+        let managed = ManagedInstall()
+        guard managed.isEnabled else {
+            print("managed slots are disabled (DSH_MANAGED=0), so there is nothing to install")
+            exit(1)
+        }
+
+        print("dsh-mac harness install")
+        print("  slots: \(AppPaths.slots.path)")
+
+        var outcome: UpdateOutcome?
+        managed.updateIdleSlot(activeSlot: nil, force: true) { outcome = $0 }
+
+        // The install runs on a background queue and hops back to the main
+        // queue, so pump the run loop rather than blocking on it.
+        let deadline = Date().addingTimeInterval(3600)
+        while outcome == nil && Date() < deadline {
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.1))
+        }
+
+        guard let outcome else {
+            print("  [FAIL] the install did not finish within an hour")
+            exit(1)
+        }
+
+        switch outcome {
+        case .staged(let version):
+            guard let candidate = managed.resolveBootCandidate(), let slot = candidate.slot else {
+                print("  [FAIL] \(version) installed, but no slot could be booted")
+                exit(1)
+            }
+            print("  [ ok ] installed harness \(version) into slot \(slot)")
+            print("  [ ok ] will boot: \(candidate.dsh)")
+            exit(0)
+        case .alreadyCurrent(let version):
+            print("  [ ok ] harness \(version) is already installed")
+            exit(0)
+        case .knownBad(let version):
+            print("  [FAIL] version \(version) previously failed to start and was not retried")
+            print("         run with DSH_SLOT_VERSION to try a different version")
+            exit(1)
+        case .deferredTrial:
+            print("  [FAIL] deferred: a version is still being watched")
+            exit(1)
+        case .unavailable(let reason):
+            print("  [FAIL] could not install the harness: \(reason ?? "unknown reason")")
+            exit(1)
+        }
+    }
+}
 /// Tests for the A/B update bookkeeping: which slot is booted, and how a slot
 /// that fails to boot hands over to the other one. These encode the guarantee
 /// that a broken upstream release cannot leave the app unusable.
-enum UpdateTests {
-    static func run() -> Never {
+enum UpdateTests {    static func run() -> Never {
         var failures = 0
 
         // These tests write slot records, so they run against a scratch support
@@ -2121,6 +2216,10 @@ if arguments.contains("--test-parser") {
 
 if arguments.contains("--test-update") {
     UpdateTests.run()
+}
+
+if arguments.contains("--install-harness") {
+    InstallHarness.run()
 }
 
 if arguments.contains("--check-contract") {

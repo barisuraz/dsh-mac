@@ -13,3 +13,8 @@ build/
 .crashtest/
 .e2e/
 .e2e-home/
+.fresh/
+.fresh2/
+.firstrun/
+.hr-app/
+.hr-test-home/

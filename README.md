@@ -39,6 +39,8 @@ The app is ad-hoc signed rather than notarized, so a downloaded copy is quaranti
 xattr -dr com.apple.quarantine "/Applications/DeepSeek Harness.app"
 ```
 
+Maintainers can produce a notarized build that needs no such workaround; see [Releasing](#releasing).
+
 ## Updates
 
 DSH is in developer preview and changes constantly, so the app updates it for you on every launch. It does that the way Android does A/B system updates: two copies are kept, an update only ever lands in the idle one, and the running copy is never modified.
@@ -69,6 +71,10 @@ Either way you get a banner naming the version that failed, the version you are 
 
 Two copies of the harness take roughly 600 MB, plus an npm cache the app keeps to itself in `~/Library/Application Support/DeepSeekHarness`. Your own npm cache is never touched.
 
+### First run
+
+You never have to install DSH yourself. If no harness exists on the machine, the first launch installs one into a slot and serves it. If you already have one, the app uses that copy immediately — the first launch is as fast as you are used to — and provisions a managed slot in the background for the next one. Either way, your existing setup is left exactly as it was.
+
 ## Behaviour worth knowing
 
 **Your existing harness is left alone.** If port `3080` is already taken, the app asks the OS for a free port instead of fighting over it.
@@ -90,6 +96,7 @@ All optional, read from the environment, so launch from a terminal to use them.
 | `DSH_WRAPPER_PORT` | `3080` | Port to prefer; falls back to an OS-assigned port if busy. |
 | `DSH_MANAGED` | `1` | Set to `0` to skip slots and updates entirely and use whatever `dsh` resolves to. |
 | `DSH_NO_AUTO_UPDATE` | `0` | Set to `1` to keep slots but never fetch anything on launch. |
+| `DSH_NO_SYSTEM_DSH` | `0` | Set to `1` to ignore any harness on `PATH` and use only managed slots. |
 | `DSH_SLOT_VERSION` | newest | Pin slots to a specific version instead of tracking the newest. |
 | `DSH_BIN` | auto-detected | Explicit path to a `dsh` executable. |
 | `DSH_NPM_BIN` | auto-detected | Explicit path to `npm`. |
@@ -141,6 +148,9 @@ APP="build/DeepSeek Harness.app/Contents/MacOS/DeepSeekHarness"
 # A/B slot bookkeeping and crash-loop detection
 "$APP" --test-update
 
+# fetch and verify a harness into a slot, without opening a window
+"$APP" --install-harness
+
 # starts a real harness and verifies the full contract
 "$APP" --check-contract
 
@@ -166,10 +176,34 @@ Sources/main.swift          the entire app: window, launcher, supervisor, slots,
 tools/make-icon.swift       the icon, drawn as vectors at each required size
 tools/deepseek-whale.path   the whale outline, taken from DSH's own frontend asset
 tools/test-ab.sh            end-to-end update and recovery tests
+tools/notarize.sh           sign, notarize, and staple a release build
 build.sh                    compiles, assembles, icons, and signs the bundle
 Info.plist                  bundle metadata
 .github/workflows/ci.yml    build, contract check, and both test suites
 ```
+
+## Releasing
+
+Builds are ad-hoc signed by default, which is all a locally built copy needs. For a release other people can open without a Gatekeeper warning, the app has to be signed with a **Developer ID Application** certificate and notarized by Apple. That requires a paid Apple Developer account; there is no way around it.
+
+`build.sh` always enables the hardened runtime, so what you test locally is what gets notarized. Set `DSH_SIGN_IDENTITY` to sign for distribution:
+
+```sh
+xcrun notarytool store-credentials "dsh-mac" \
+  --apple-id "you@example.com" \
+  --team-id "YOURTEAMID" \
+  --password "app-specific-password"
+
+DSH_SIGN_IDENTITY="Developer ID Application: Your Name (YOURTEAMID)" \
+  ./tools/notarize.sh --check     # verify prerequisites first
+
+DSH_SIGN_IDENTITY="Developer ID Application: Your Name (YOURTEAMID)" \
+  ./tools/notarize.sh             # build, submit, staple
+```
+
+The script builds and signs the app, refuses to continue if the signature is not Developer ID, not hardened, or not timestamped, submits the bundle with `notarytool --wait`, staples the ticket, checks that Gatekeeper accepts the result, and leaves a `build/dsh-mac-<version>.zip` ready to upload. The step-by-step setup for the certificate and the app-specific password is in the header of [tools/notarize.sh](tools/notarize.sh).
+
+The app needs no entitlement exceptions: it is a plain AppKit app that spawns `node` and `zsh` as separate processes, and hardened runtime restrictions are per-binary, so the interpreter it launches is unaffected. `build.sh` will pick up a `tools/entitlements.plist` if one is ever needed.
 
 ## License
 

@@ -80,11 +80,39 @@ else
 	echo "     (iconutil unavailable; building without an icon)"
 fi
 
-echo "==> ad-hoc signing"
-# Ad-hoc signing is enough for a locally built app. It is also what makes the
-# app's storage container stable, so the session cookie survives relaunches.
-codesign --force --sign - --timestamp=none "$APP" >/dev/null 2>&1 \
-	|| echo "     (ad-hoc signing skipped; the app still runs locally)"
+echo "==> signing"
+# Ad-hoc signing is enough for a locally built app, and it is what makes the
+# app's storage container stable so the session cookie survives relaunches.
+#
+# Set DSH_SIGN_IDENTITY to sign for distribution instead:
+#
+#   DSH_SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" ./build.sh
+#
+# The hardened runtime is enabled in both cases, so what you test locally is
+# what gets notarized.
+SIGN_IDENTITY="${DSH_SIGN_IDENTITY:--}"
+SIGN_ARGS=(--force --options runtime --sign "$SIGN_IDENTITY")
+if [[ "$SIGN_IDENTITY" == "-" ]]; then
+	# Ad-hoc signatures cannot carry a secure timestamp.
+	SIGN_ARGS+=(--timestamp=none)
+else
+	# Developer ID signatures must, or notarization is rejected.
+	SIGN_ARGS+=(--timestamp)
+fi
+
+if [[ -f "$HERE/tools/entitlements.plist" ]]; then
+	SIGN_ARGS+=(--entitlements "$HERE/tools/entitlements.plist")
+fi
+
+if codesign "${SIGN_ARGS[@]}" "$APP" >/dev/null 2>&1; then
+	if [[ "$SIGN_IDENTITY" == "-" ]]; then
+		echo "     ad-hoc signed (hardened runtime)"
+	else
+		echo "     signed as: $SIGN_IDENTITY"
+	fi
+else
+	echo "     (signing skipped; the app still runs locally)"
+fi
 
 echo "==> built: $APP"
 echo
@@ -94,4 +122,6 @@ echo
 echo "Diagnostics:"
 echo "  \"$APP/Contents/MacOS/$BIN_NAME\" --selftest        # what it resolved"
 echo "  \"$APP/Contents/MacOS/$BIN_NAME\" --test-parser     # readiness-line parser"
+echo "  \"$APP/Contents/MacOS/$BIN_NAME\" --test-update     # A/B slot and crash-loop logic"
+echo "  \"$APP/Contents/MacOS/$BIN_NAME\" --install-harness # fetch a harness into a slot"
 echo "  \"$APP/Contents/MacOS/$BIN_NAME\" --check-contract  # end-to-end harness check"
