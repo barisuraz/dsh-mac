@@ -7,14 +7,13 @@ A stored session log containing an event type the harness does not know is
 refused outright, unless the event carries the envelope marker
 `ignorable: true`:
 
-    session "..." contains event type "web/keiro-search-request" (seq 18)
-    unknown to this harness and not marked ignorable; refusing to interpret
-    the log — it was likely written by a newer harness
+    session "..." contains event type "acme-plugin/telemetry" (seq 18) unknown
+    to this harness and not marked ignorable; refusing to interpret the log
 
 That refusal is deliberate and correct: silently skipping an event that shapes
 reconstruction would resume a subtly wrong session. But the harness's known-type
 catalog is generated in-repo, so an **out-of-repo plugin's** events are outside
-it `by construction` — and `Session.append()` gives a plugin no way to set the
+it "by construction" — and `Session.append()` gives a plugin no way to set the
 `ignorable` marker. So a plugin that appends its own event type writes a log
 that no harness can ever reload, including the one that wrote it. `append` does
 not validate on write, so nothing fails until the next time the session is

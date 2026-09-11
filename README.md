@@ -162,8 +162,8 @@ wrote it, since `append` does not validate on write. The failure only appears th
 next time the session is opened:
 
 ```
-session "..." contains event type "web/keiro-search-request" (seq 18) unknown
-to this harness and not marked ignorable; refusing to interpret the log
+session "..." contains event type "<plugin>/event-name" (seq 18) unknown to
+this harness and not marked ignorable; refusing to interpret the log
 ```
 
 `tools/repair-sessions.py` marks named event types as skippable so the log loads
@@ -175,8 +175,9 @@ while a harness still holds the session open, since that harness would overwrite
 the repair on its next flush.
 
 ```
-python3 tools/repair-sessions.py ~/.dsh/sessions/<workspace>/<session>/session.v3.jsonl.zstd \
-    --type web/keiro-search-request
+python3 tools/repair-sessions.py \
+    ~/.dsh/sessions/<workspace>/<session>/session.v3.jsonl.zstd \
+    --type <plugin>/<event>
 ```
 
 The better fix is the plugin's: stop writing the event. Confirm the event is

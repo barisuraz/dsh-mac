@@ -47,7 +47,7 @@ lines = [
 ]
 if kind != "clean":
     lines.append(json.dumps(
-        {"type": "web/keiro-search-request", "seq": 1, "time": 2,
+        {"type": "example-plugin/telemetry", "seq": 1, "time": 2,
          "data": {"endpoint": "https://example.test"}}, separators=(",", ":")))
 lines.append(json.dumps({"type": "turn/end", "seq": 2, "time": 3, "data": {}},
                         separators=(",", ":")))
@@ -64,7 +64,7 @@ mkdir -p "$SCRATCH/ok/session-aaaa"
 LOG="$SCRATCH/ok/session-aaaa/session.v3.jsonl.zstd"
 make_log "$LOG" unknown
 
-if python3 "$TOOL" "$LOG" --type web/keiro-search-request >"$SCRATCH/out" 2>&1; then
+if python3 "$TOOL" "$LOG" --type example-plugin/telemetry >"$SCRATCH/out" 2>&1; then
 	check "repairs a log with a named unknown event" 1
 else
 	check "repairs a log with a named unknown event" 0
@@ -78,8 +78,8 @@ python3 - "$LOG" <<'PY' && check "marks only the named event, leaving others int
 import json, subprocess, sys
 raw = subprocess.run(["zstd","-dc",sys.argv[1]], capture_output=True, check=True).stdout
 events = [json.loads(l) for l in raw.split(b"\n") if l.strip()][1:]
-unknown = [e for e in events if e["type"] == "web/keiro-search-request"]
-others = [e for e in events if e["type"] != "web/keiro-search-request"]
+unknown = [e for e in events if e["type"] == "example-plugin/telemetry"]
+others = [e for e in events if e["type"] != "example-plugin/telemetry"]
 assert len(unknown) == 1 and unknown[0].get("ignorable") is True, unknown
 assert all("ignorable" not in e for e in others), others
 # Order and sequence numbers must be untouched.
@@ -91,7 +91,7 @@ PY
 mkdir -p "$SCRATCH/clean/session-bbbb"
 make_log "$SCRATCH/clean/session-bbbb/session.v3.jsonl.zstd" clean
 if python3 "$TOOL" "$SCRATCH/clean/session-bbbb/session.v3.jsonl.zstd" \
-	--type web/keiro-search-request >/dev/null 2>&1; then
+	--type example-plugin/telemetry >/dev/null 2>&1; then
 	check "leaves an already-loadable log alone" 1
 else
 	check "leaves an already-loadable log alone" 0
@@ -122,7 +122,7 @@ fi
 mkdir -p "$SCRATCH/legacy/session-eeee"
 make_log "$SCRATCH/legacy/session-eeee/session.jsonl.zstd" unknown
 if python3 "$TOOL" "$SCRATCH/legacy/session-eeee/session.jsonl.zstd" \
-	--type web/keiro-search-request >/dev/null 2>&1; then
+	--type example-plugin/telemetry >/dev/null 2>&1; then
 	check "refuses a legacy-format log" 0
 else
 	check "refuses a legacy-format log" 1
@@ -133,7 +133,7 @@ mkdir -p "$SCRATCH/dry/session-ffff"
 DRY="$SCRATCH/dry/session-ffff/session.v3.jsonl.zstd"
 make_log "$DRY" unknown
 BEFORE=$(shasum -a 256 "$DRY" | awk '{print $1}')
-python3 "$TOOL" "$DRY" --type web/keiro-search-request --dry-run >/dev/null 2>&1 || true
+python3 "$TOOL" "$DRY" --type example-plugin/telemetry --dry-run >/dev/null 2>&1 || true
 AFTER=$(shasum -a 256 "$DRY" | awk '{print $1}')
 if [ "$BEFORE" = "$AFTER" ]; then
 	check "a dry run writes nothing" 1
@@ -145,7 +145,7 @@ fi
 mkdir -p "$SCRATCH/backup/session-gggg"
 BK="$SCRATCH/backup/session-gggg/session.v3.jsonl.zstd"
 make_log "$BK" unknown
-python3 "$TOOL" "$BK" --type web/keiro-search-request >/dev/null 2>&1 || true
+python3 "$TOOL" "$BK" --type example-plugin/telemetry >/dev/null 2>&1 || true
 if [ "$(find "$HOME/.dsh/session-format-repairs" -name 'session-gggg.*' 2>/dev/null | wc -l | tr -d ' ')" -ge 1 ]; then
 	check "keeps a backup of the original" 1
 	rm -f "$HOME"/.dsh/session-format-repairs/session-gggg.* 2>/dev/null || true
