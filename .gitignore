@@ -29,3 +29,5 @@ build/
 .dmgtest/
 .ghcache/
 .fresh-target/
+.npmcache/
+.rc2/

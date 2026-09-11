@@ -139,8 +139,48 @@ APP="/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeekHarness"
 "$APP" --check-contract    # start a real harness and verify the contract
 "$APP" --screenshot out.png --notice rollback   # render the window to a PNG
 
+./tools/test-repair.sh     # session-log repair, against synthetic logs
+
+# Recover a session a plugin made unloadable (see below).
+python3 tools/repair-sessions.py <session.v3.jsonl.zstd> --type <event-type>
+
 ./tools/test-ab.sh         # recovery, against deliberately broken harnesses
 ```
+
+## Recovering an unloadable session
+
+A session log containing an event type the harness does not know is refused
+outright, unless the event carries the marker `ignorable: true`. The check is
+deliberate: silently skipping an event that shapes reconstruction would resume a
+subtly wrong session.
+
+The trap is out-of-repo plugins. The harness's known-type catalog is generated
+in-repo, so a plugin's own event types are outside it by construction, and
+`Session.append()` gives a plugin no way to set the marker. A plugin that appends
+one therefore writes a log that no harness can reopen — including the one that
+wrote it, since `append` does not validate on write. The failure only appears the
+next time the session is opened:
+
+```
+session "..." contains event type "web/keiro-search-request" (seq 18) unknown
+to this harness and not marked ignorable; refusing to interpret the log
+```
+
+`tools/repair-sessions.py` marks named event types as skippable so the log loads
+again. It only ever touches types you name explicitly — never guessing, because
+marking an event ignorable tells every future reader to discard it, which is safe
+for a request record and unsafe for anything that shapes the session. It keeps a
+copy of each original under `~/.dsh/session-format-repairs/`, and refuses to run
+while a harness still holds the session open, since that harness would overwrite
+the repair on its next flush.
+
+```
+python3 tools/repair-sessions.py ~/.dsh/sessions/<workspace>/<session>/session.v3.jsonl.zstd \
+    --type web/keiro-search-request
+```
+
+The better fix is the plugin's: stop writing the event. Confirm the event is
+informational in the plugin's source before repairing.
 
 ## Security
 
@@ -163,6 +203,9 @@ tools/package.sh            builds a release disk image and verifies it by mount
 tools/make-dmg.sh           the disk image itself
 tools/notarize.sh           sign, notarize, and staple a release build
 tools/test-ab.sh            end-to-end update and recovery tests
+tools/repair-sessions.py    marks informational plugin events ignorable so their logs load
+tools/test-repair.sh        tests for the repair tool's rewrites and its refusals
+tools/known-event-types.json  the harness's event catalog, as this build knows it
 tools/make-icon.swift       the icon, drawn as vectors at each required size
 docs/                       screenshots, rendered by the app itself
 ```
