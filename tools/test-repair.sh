@@ -34,26 +34,47 @@ command -v zstd >/dev/null || {
 
 # A minimal current-format log: one header line, then events. The unknown event
 # is the one the tool is allowed to mark; the known one must be left alone.
+#
+# The layout matters as much as the content. The harness writes the header in a
+# frame of its own and every durable append batch in another, and it refuses a log
+# whose first frame is not *exactly* one line. A fixture compressed as a single
+# frame passes every line-based assertion and is still a log no harness will open,
+# which is precisely how a frame-flattening bug once shipped here.
 make_log() {
 	python3 - "$1" "$2" <<'PY'
 import json, subprocess, sys
 out, kind = sys.argv[1], sys.argv[2]
-lines = [
-    json.dumps({"type": "session", "version": 3, "id": "synthetic",
-                "createdAt": 0, "cwd": "/tmp", "isSeeded": False,
-                "delegationDepth": 0}, separators=(",", ":")),
+header = json.dumps(
+    {"type": "session", "version": 3, "id": "synthetic",
+     "createdAt": 0, "cwd": "/tmp", "isSeeded": False,
+     "delegationDepth": 0}, separators=(",", ":"))
+events = [
     json.dumps({"type": "turn/start", "seq": 0, "time": 1, "data": {}},
                separators=(",", ":")),
 ]
 if kind != "clean":
-    lines.append(json.dumps(
+    events.append(json.dumps(
         {"type": "example-plugin/telemetry", "seq": 1, "time": 2,
          "data": {"endpoint": "https://example.test"}}, separators=(",", ":")))
-lines.append(json.dumps({"type": "turn/end", "seq": 2, "time": 3, "data": {}},
-                        separators=(",", ":")))
-payload = ("\n".join(lines) + "\n").encode()
-subprocess.run(["zstd", "-q", "-f", "-o", out], input=payload, check=True)
+events.append(json.dumps({"type": "turn/end", "seq": 2, "time": 3, "data": {}},
+                         separators=(",", ":")))
+
+def frame(text):
+    return subprocess.run(["zstd", "-q", "-c", "--check"],
+                          input=text.encode(), capture_output=True, check=True).stdout
+
+frames = [frame(header + "\n")]
+# Two events per frame, as the writer's append batches produce.
+for start in range(0, len(events), 2):
+    frames.append(frame("\n".join(events[start:start + 2]) + "\n"))
+with open(out, "wb") as handle:
+    handle.write(b"".join(frames))
 PY
+}
+
+# Frame count, as the filesystem sees it -- the harness's own yardstick.
+frames_of() {
+	zstd --list "$1" 2>/dev/null | tail -1 | awk '{print $1}'
 }
 
 echo "session repair tests"
@@ -84,6 +105,30 @@ assert len(unknown) == 1 and unknown[0].get("ignorable") is True, unknown
 assert all("ignorable" not in e for e in others), others
 # Order and sequence numbers must be untouched.
 assert [e["seq"] for e in events] == [0, 1, 2], events
+PY
+
+# The rewrite must not reflow the log's physical frames. Getting this wrong
+# produces a file that satisfies every check above and that the harness refuses
+# to open, taking the whole GUI down with it.
+if [ "$(frames_of "$LOG")" -gt 1 ]; then
+	check "preserves the multi-frame layout" 1
+else
+	check "preserves the multi-frame layout" 0
+fi
+
+python3 - "$LOG" "$TOOL" <<'PY' && check "keeps the header alone in the first frame" 1 \
+	|| check "keeps the header alone in the first frame" 0
+import importlib.util, sys
+path, tool = sys.argv[1], sys.argv[2]
+spec = importlib.util.spec_from_file_location("repair_sessions", tool)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+raw = open(path, "rb").read()
+frames = module.frame_ranges(raw)
+assert len(frames) > 1, f"expected several frames, found {len(frames)}"
+first = module.decompress_bytes(raw[frames[0][0]:frames[0][1]])
+# Exactly one line, terminated: header and nothing else.
+assert first.count(b"\n") == 1 and first.endswith(b"\n"), first[:200]
 PY
 
 # ── the guards ───────────────────────────────────────────────────────────────

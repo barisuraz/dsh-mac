@@ -88,6 +88,110 @@ def decompress(path: str) -> bytes:
     return result.stdout
 
 
+ZSTD_MAGIC = 0xFD2FB528
+
+
+def frame_ranges(raw: bytes) -> list:
+    """Byte ranges of each complete Zstandard frame in `raw`.
+
+    A faithful port of the harness's own `scanZstdFrames`. It walks frame
+    headers and block headers without decompressing anything, which is the only
+    way to find frame boundaries: the compressed bytes contain no marker that
+    could be searched for.
+
+    This matters because the harness requires the *first frame* to decompress to
+    exactly one line. Re-compressing a whole log into a single frame satisfies
+    every line-based check and still produces a file the harness refuses to open.
+    """
+    ranges = []
+    offset = 0
+    while offset < len(raw):
+        start = offset
+        if len(raw) - offset < 4:
+            raise RuntimeError(f"truncated frame header at byte {offset}")
+        if int.from_bytes(raw[offset:offset + 4], "little") != ZSTD_MAGIC:
+            raise RuntimeError(f"invalid frame magic at byte {offset}")
+        offset += 4
+        if offset >= len(raw):
+            raise RuntimeError(f"truncated frame at byte {start}")
+        descriptor = raw[offset]
+        offset += 1
+        if descriptor & 24:
+            raise RuntimeError(f"reserved frame-header bit at byte {offset - 1}")
+        content_size_flag = descriptor >> 6
+        single_segment = bool(descriptor & 32)
+        dictionary_flag = descriptor & 3
+        dictionary_bytes = 4 if dictionary_flag == 3 else dictionary_flag
+        if content_size_flag == 0:
+            content_size_bytes = 1 if single_segment else 0
+        else:
+            content_size_bytes = 1 << content_size_flag
+        offset += (0 if single_segment else 1) + dictionary_bytes + content_size_bytes
+        if offset > len(raw):
+            raise RuntimeError(f"truncated frame header at byte {start}")
+
+        while True:
+            if len(raw) - offset < 3:
+                raise RuntimeError(f"truncated block header at byte {offset}")
+            block_header = int.from_bytes(raw[offset:offset + 3], "little")
+            offset += 3
+            last_block = bool(block_header & 1)
+            block_type = (block_header >> 1) & 3
+            block_size = block_header >> 3
+            if block_type == 3:
+                raise RuntimeError(f"reserved block type at byte {offset - 3}")
+            # An RLE block carries one byte however large it expands to.
+            offset += 1 if block_type == 1 else block_size
+            if offset > len(raw):
+                raise RuntimeError(f"truncated block at byte {start}")
+            if last_block:
+                break
+        # A checksummed frame ends with a 4-byte content checksum, which the
+        # harness always writes.
+        if descriptor & 4:
+            offset += 4
+            if offset > len(raw):
+                raise RuntimeError(f"truncated checksum at byte {start}")
+        ranges.append((start, offset))
+    return ranges
+
+
+def decompress_bytes(blob: bytes) -> bytes:
+    result = subprocess.run(["zstd", "-dc"], input=blob, capture_output=True)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.decode().strip() or "zstd failed")
+    return result.stdout
+
+
+def compress_frame(plaintext: bytes) -> bytes:
+    """One independently decodable, checksummed frame -- what the harness writes."""
+    result = subprocess.run(["zstd", "-q", "-c", "--check"],
+                            input=plaintext, capture_output=True)
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.decode().strip() or "zstd failed")
+    return result.stdout
+
+
+def check_framing(path: str) -> str:
+    """Empty if the log's frame layout is one the harness will accept."""
+    raw = open(path, "rb").read()
+    try:
+        frames = frame_ranges(raw)
+    except RuntimeError as error:
+        return str(error)
+    if not frames:
+        return "no frames"
+    header = decompress_bytes(raw[frames[0][0]:frames[0][1]])
+    if not header or header.count(b"\n") != 1 or not header.endswith(b"\n"):
+        return (f"first frame is not exactly one header line "
+                f"({header.count(bytes([10]))} lines, {len(header)} bytes)")
+    try:
+        decompress_bytes(raw)
+    except RuntimeError as error:
+        return f"the log no longer decompresses as a whole: {error}"
+    return ""
+
+
 def scan(raw: bytes, known: set) -> dict:
     """Unknown, non-ignorable event types in a decompressed log, with counts."""
     counts: dict = {}
@@ -138,34 +242,63 @@ def backup(path: str) -> str:
 
 
 def rewrite(path: str, raw: bytes, types: set) -> int:
-    """Mark events of `types` ignorable. Returns how many were changed."""
-    out = []
+    """Mark events of `types` ignorable. Returns how many were changed.
+
+    Rewrites frame by frame so the harness's physical layout survives: the first
+    frame must hold the header and nothing else. Only frames that actually
+    contained a changed event are recompressed, so untouched bytes stay
+    byte-identical and a checksum failure cannot be introduced anywhere else.
+    """
+    frames = frame_ranges(raw)
+    if not frames:
+        raise RuntimeError("no Zstandard frames found")
+
     changed = 0
-    for index, line in enumerate(raw.split(b"\n")):
-        keep = line
-        stripped = line.strip()
-        if index > 0 and stripped:
-            try:
-                event = json.loads(stripped)
-            except Exception:
-                event = None
-            if (isinstance(event, dict) and event.get("type") in types
-                    and event.get("ignorable") is not True):
-                event["ignorable"] = True
-                keep = json.dumps(event, separators=(",", ":"),
-                                  ensure_ascii=False).encode()
-                changed += 1
-        out.append(keep)
+    encoded = []
+    for index, (start, end) in enumerate(frames):
+        plaintext = decompress_bytes(raw[start:end])
+        lines = plaintext.split(b"\n")
+        # The writer terminates every frame's plaintext with a newline, so the
+        # trailing split element is empty. Preserve that exactly.
+        trailing = lines.pop() if lines and lines[-1] == b"" else None
+        touched = False
+        out = []
+        for line in lines:
+            keep = line
+            stripped = line.strip()
+            if stripped:
+                try:
+                    event = json.loads(stripped)
+                except Exception:
+                    event = None
+                if (isinstance(event, dict) and event.get("type") in types
+                        and event.get("ignorable") is not True):
+                    event["ignorable"] = True
+                    keep = json.dumps(event, separators=(",", ":"),
+                                      ensure_ascii=False).encode()
+                    changed += 1
+                    touched = True
+            out.append(keep)
+        if not touched:
+            encoded.append(raw[start:end])
+            continue
+        body = b"\n".join(out)
+        if trailing is not None:
+            body += b"\n"
+        if index == 0:
+            # The header must stay alone in its own frame even if a change
+            # somehow landed in it.
+            body = body.split(b"\n")[0] + b"\n"
+        encoded.append(compress_frame(body))
 
     if changed == 0:
         return 0
 
-    # Compress beside the target and replace atomically, so an interrupted run
+    # Write beside the target and replace atomically, so an interrupted run
     # cannot leave a half-written session.
     temp = os.path.join(os.path.dirname(path), ".session-repair.tmp.zst")
-    proc = subprocess.run(["zstd", "-q", "-f", "-o", temp], input=b"\n".join(out))
-    if proc.returncode != 0:
-        raise RuntimeError("could not recompress the log")
+    with open(temp, "wb") as handle:
+        handle.write(b"".join(encoded))
     os.replace(temp, path)
     return changed
 
@@ -236,7 +369,9 @@ def main() -> int:
 
         try:
             saved = backup(path)
-            changed = rewrite(path, raw, set(args.type))
+            with open(path, "rb") as handle:
+                encoded = handle.read()
+            changed = rewrite(path, encoded, set(args.type))
         except Exception as error:
             print(f"  {name}: FAILED: {error}")
             failures += 1
@@ -245,6 +380,16 @@ def main() -> int:
         after = scan(decompress(path), known)
         if after:
             print(f"  {name}: still has unknown events after the rewrite: {after}")
+            failures += 1
+            continue
+
+        # A log that passes every line-based check can still be unopenable: the
+        # harness insists the first frame hold the header alone. Verify the
+        # rewrite kept that, because getting it wrong turns a readable log into
+        # one that blocks the whole harness from starting.
+        problem = check_framing(path)
+        if problem:
+            print(f"  {name}: rewrite broke the frame layout: {problem}")
             failures += 1
             continue
 
