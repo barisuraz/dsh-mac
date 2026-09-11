@@ -31,3 +31,5 @@ build/
 .fresh-target/
 .npmcache/
 .rc2/
+build-tests/
+.review/

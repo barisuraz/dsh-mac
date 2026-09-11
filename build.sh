@@ -8,7 +8,11 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-APP="$HERE/build/DeepSeek Harness.app"
+# DSH_BUILD_DIR keeps a test build out of the way of the release build, so CI can
+# hold both at once: the release app is what gets packaged, and it must be the one
+# without test code in it.
+BUILD_DIR="${DSH_BUILD_DIR:-build}"
+APP="$HERE/$BUILD_DIR/DeepSeek Harness.app"
 BIN_NAME="DeepSeekHarness"
 CACHE="$HERE/.build-cache"
 
@@ -26,12 +30,21 @@ mkdir -p "$CACHE"
 # icon, and can be launched in place of the installed app. This marker tells
 # Spotlight to leave the build directory alone, which keeps local builds out of
 # both. It goes in before the bundle exists so the app is never indexed.
-mkdir -p "$HERE/build"
-touch "$HERE/build/.metadata_never_index"
+mkdir -p "$HERE/$BUILD_DIR"
+touch "$HERE/$BUILD_DIR/.metadata_never_index"
 
 # -module-cache-path keeps clang's module cache inside the project: the default
 # cache lives in the system temp directory, which a sandboxed shell may not write.
 COMMON_FLAGS=(-O -swift-version 5 -module-cache-path "$CACHE/modules")
+
+# The unit-test runners are behind `#if DSH_TESTS` so a shipped app contains no
+# test code. A test build opts in:
+#
+#   DSH_BUILD_TESTS=1 ./build.sh && "build/DeepSeek Harness.app/Contents/MacOS/DeepSeekHarness" --test-update
+if [ "${DSH_BUILD_TESTS:-0}" = "1" ]; then
+	COMMON_FLAGS+=(-DDSH_TESTS)
+	echo "==> test build (unit-test runners included)"
+fi
 
 echo "==> compiling"
 rm -rf "$APP"

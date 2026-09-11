@@ -22,7 +22,12 @@ jobs:
           sw_vers
 
       - name: Build the app
-        run: ./build.sh
+        run: |
+          # Two builds on purpose. The release build is what ships and must not
+          # contain the unit-test runners; the test build carries them so the
+          # suites can run. Building both is what proves the first claim.
+          ./build.sh
+          DSH_BUILD_DIR=build-tests DSH_BUILD_TESTS=1 ./build.sh
 
       - name: Verify the bundle
         run: |
@@ -31,17 +36,36 @@ jobs:
           test -f "$APP/Contents/Resources/AppIcon.icns"
           codesign --verify --deep --strict "$APP" && echo "signature ok"
 
+      - name: Verify the release build carries no test code
+        run: |
+          APP="build/DeepSeek Harness.app"
+          codesign --verify --deep --strict "$APP"
+          if nm -a "$APP/Contents/MacOS/DeepSeekHarness" | grep -qE '(UpdateTests|NoticeTests|ParserTests|ConcurrencyTests)'; then
+            echo "test runners are compiled into the release build"; exit 1
+          fi
+          # The flags must be refused rather than falling through to the GUI.
+          if "$APP/Contents/MacOS/DeepSeekHarness" --test-update; then
+            echo "--test-update unexpectedly succeeded in a release build"; exit 1
+          fi
+          echo "release build is free of test code"
+
       - name: Run the readiness-line parser tests
         run: |
-          "build/DeepSeek Harness.app/Contents/MacOS/DeepSeekHarness" --test-parser
+          "build-tests/DeepSeek Harness.app/Contents/MacOS/DeepSeekHarness" --test-parser
 
       - name: Run the A/B update and crash-loop tests
         run: |
-          "build/DeepSeek Harness.app/Contents/MacOS/DeepSeekHarness" --test-update
+          "build-tests/DeepSeek Harness.app/Contents/MacOS/DeepSeekHarness" --test-update
 
       - name: Run the notice card tests
         run: |
-          "build/DeepSeek Harness.app/Contents/MacOS/DeepSeekHarness" --test-notice
+          "build-tests/DeepSeek Harness.app/Contents/MacOS/DeepSeekHarness" --test-notice
+
+      - name: Run the concurrency tests
+        run: |
+          # These exercise the state lock and healthCheck under real threads.
+          # They are the only tests that would catch a reintroduced race.
+          "build-tests/DeepSeek Harness.app/Contents/MacOS/DeepSeekHarness" --test-concurrency
 
       - name: Run the end-to-end recovery tests
         run: ./tools/test-ab.sh

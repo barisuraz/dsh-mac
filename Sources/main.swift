@@ -435,10 +435,33 @@ enum UpdateOutcome {
 ///
 /// The app is usable from the moment the preferred slot starts; updating happens
 /// afterwards, so a slow or failed download never blocks or breaks a launch.
+/// Owns the installed harness copies and which one boots.
+///
+/// ## Threading
+///
+/// This type is thread-safe. `state` is reached from the main queue (the app's
+/// own records: a boot succeeded, a version crashed) and from `queue` (an
+/// update deciding what to install), so every read and write goes through
+/// `lock`. The lock is recursive so the small helpers — `save`, `discard` —
+/// can be called from inside a critical section without deadlocking.
+///
+/// Critical sections are kept to state alone. Nothing slow (npm, a health
+/// check) and no caller's completion handler runs while the lock is held, so
+/// the lock can never be the thing that hangs the UI.
 final class ManagedInstall {
     private(set) var state = InstallState()
     private let queue = DispatchQueue(label: "dsh.managed-install")
+    /// Serializes every access to `state`. Recursive because the mutating
+    /// helpers below are called from within other critical sections.
+    private let lock = NSRecursiveLock()
     private var installer: Process?
+
+    /// Run `body` with exclusive access to `state`.
+    private func withState<T>(_ body: () -> T) -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return body()
+    }
 
     /// Escape hatches: `DSH_MANAGED=0` restores the old behaviour of using
     /// whatever `dsh` is on PATH, and `DSH_SLOT_VERSION` pins a version instead
@@ -479,16 +502,20 @@ final class ManagedInstall {
         AppPaths.ensureDirectories()
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        if let data = try? encoder.encode(state) {
-            try? data.write(to: AppPaths.state, options: .atomic)
+        withState {
+            if let data = try? encoder.encode(state) {
+                try? data.write(to: AppPaths.state, options: .atomic)
+            }
         }
     }
 
     /// Drop a slot's record and its files.
     private func discard(_ name: String) {
-        state.slots[name] = nil
-        if state.preferred == name { state.preferred = nil }
-        if state.staged == name { state.staged = nil }
+        withState {
+            state.slots[name] = nil
+            if state.preferred == name { state.preferred = nil }
+            if state.staged == name { state.staged = nil }
+        }
         try? FileManager.default.removeItem(at: AppPaths.slot(name))
     }
 
@@ -503,18 +530,22 @@ final class ManagedInstall {
     /// existing install still works if the managed tree is unavailable.
     func resolveBootCandidate() -> (dsh: String, slot: String?)? {
         if isEnabled {
-            var order: [String] = []
-            if let staged = state.staged { order.append(staged) }
-            if let preferred = state.preferred, !order.contains(preferred) { order.append(preferred) }
-            for name in InstallState.slotNames where !order.contains(name) { order.append(name) }
+            let candidate: String? = withState {
+                var order: [String] = []
+                if let staged = state.staged { order.append(staged) }
+                if let preferred = state.preferred, !order.contains(preferred) { order.append(preferred) }
+                for name in InstallState.slotNames where !order.contains(name) { order.append(name) }
 
-            for name in order {
-                guard let slot = state.slots[name], !slot.broken else { continue }
-                let binary = AppPaths.slotBinary(name).path
-                if FileManager.default.isExecutableFile(atPath: binary) {
-                    return (binary, name)
+                for name in order {
+                    guard let slot = state.slots[name], !slot.broken else { continue }
+                    let binary = AppPaths.slotBinary(name).path
+                    if FileManager.default.isExecutableFile(atPath: binary) {
+                        return name
+                    }
                 }
+                return nil
             }
+            if let candidate { return (AppPaths.slotBinary(candidate).path, candidate) }
         }
         if let path = Locator.dshPath() { return (path, nil) }
         return nil
@@ -524,16 +555,18 @@ final class ManagedInstall {
     /// be the next boot.
     func recordHealthy(slot: String?) {
         guard let slot, isEnabled else { return }
-        state.slots[slot]?.verifiedAt = Date()
-        state.slots[slot]?.broken = false
-        // Booting the staged slot completes the update: it is now the one we
-        // come back to, and the version it replaced becomes the fallback.
-        if state.staged == slot {
-            state.preferred = slot
-            state.staged = nil
-            Log.shared.write("update to \(state.slots[slot]?.version ?? "?") is now active")
-        } else if state.preferred == nil {
-            state.preferred = slot
+        withState {
+            state.slots[slot]?.verifiedAt = Date()
+            state.slots[slot]?.broken = false
+            // Booting the staged slot completes the update: it is now the one we
+            // come back to, and the version it replaced becomes the fallback.
+            if state.staged == slot {
+                state.preferred = slot
+                state.staged = nil
+                Log.shared.write("update to \(state.slots[slot]?.version ?? "?") is now active")
+            } else if state.preferred == nil {
+                state.preferred = slot
+            }
         }
         save()
     }
@@ -543,19 +576,21 @@ final class ManagedInstall {
     func recordBroken(slot: String?, reason: String) {
         guard let slot, isEnabled else { return }
         Log.shared.write("slot \(slot) failed to boot: \(reason)")
-        // Remember the version too, so the next update run does not download and
-        // retest the exact release that just failed.
-        if let version = state.slots[slot]?.version {
-            state.rejected[version] = reason.split(separator: "\n").first.map(String.init) ?? reason
-        }
-        state.slots[slot]?.broken = true
-        state.slots[slot]?.verifiedAt = nil
-        state.staged = nil
-        // Fall back to the other slot for the next attempt.
-        let other = state.other(than: slot)
-        if let candidate = state.slots[other], candidate.isUsable {
-            state.preferred = other
-            Log.shared.write("falling back to slot \(other) (\(candidate.version))")
+        withState {
+            // Remember the version too, so the next update run does not download and
+            // retest the exact release that just failed.
+            if let version = state.slots[slot]?.version {
+                state.rejected[version] = reason.split(separator: "\n").first.map(String.init) ?? reason
+            }
+            state.slots[slot]?.broken = true
+            state.slots[slot]?.verifiedAt = nil
+            state.staged = nil
+            // Fall back to the other slot for the next attempt.
+            let other = state.other(than: slot)
+            if let candidate = state.slots[other], candidate.isUsable {
+                state.preferred = other
+                Log.shared.write("falling back to slot \(other) (\(candidate.version))")
+            }
         }
         save()
     }
@@ -567,14 +602,24 @@ final class ManagedInstall {
     /// Never touches the slot that is currently booted. On success the idle slot
     /// becomes `staged` and is used on the next launch; on failure it is
     /// discarded and the running version is untouched.
+    ///
+    /// The completion handler is always called on the **main** queue, whichever
+    /// path produced the outcome. The early guard runs on the caller's thread,
+    /// the work runs on `queue`, and the callers are UI code that must not be
+    /// surprised by which one they got; before this was uniform, one branch
+    /// mutated and saved state from the background queue while every other
+    /// branch hopped to main.
     func updateIdleSlot(
         activeSlot: String?, force: Bool = false, completion: @escaping (UpdateOutcome) -> Void
     ) {
-        guard isEnabled else { return completion(.unavailable("managed updates are off")) }
+        let finish: (UpdateOutcome) -> Void = { outcome in
+            DispatchQueue.main.async { completion(outcome) }
+        }
+        guard isEnabled else { return finish(.unavailable("managed updates are off")) }
 
         queue.async { [weak self] in
-            guard let self else { return completion(.unavailable(nil)) }
-            let target = self.state.other(than: activeSlot)
+            guard let self else { return finish(.unavailable(nil)) }
+            let target = self.withState { self.state.other(than: activeSlot) }
 
             if activeSlot == nil {
                 Log.shared.write("update: no managed slot yet, provisioning slot \(target)")
@@ -582,27 +627,29 @@ final class ManagedInstall {
 
             guard let npm = Locator.npmPath() else {
                 Log.shared.write("update skipped: npm not found")
-                return completion(.unavailable("npm was not found"))
+                return finish(.unavailable("npm was not found"))
             }
 
             let wanted = self.pinnedVersion ?? self.latestVersion(npm: npm)
             guard let wanted else {
                 Log.shared.write("update skipped: could not determine the newest version")
-                return completion(.unavailable("the newest version could not be determined"))
+                return finish(.unavailable("the newest version could not be determined"))
             }
 
             // Nothing to do when the running slot is already newest. Without
             // this, every launch would install the same version into the idle
             // slot and swap between them pointlessly.
-            if !force, let active = activeSlot, self.state.slots[active]?.version == wanted {
+            if !force, let active = activeSlot,
+                self.withState({ self.state.slots[active]?.version }) == wanted
+            {
                 Log.shared.write("update: running slot \(active) is already the newest (\(wanted))")
-                return completion(.alreadyCurrent(wanted))
+                return finish(.alreadyCurrent(wanted))
             }
 
             // Do not keep retrying a release that already failed to start.
-            if !force, let why = self.state.rejected[wanted] {
+            if !force, let why = self.withState({ self.state.rejected[wanted] }) {
                 Log.shared.write("update: \(wanted) is known bad (\(why)); not retrying")
-                return completion(.knownBad(wanted))
+                return finish(.knownBad(wanted))
             }
 
             // Refuse to overwrite the fallback while the running version is
@@ -611,27 +658,30 @@ final class ManagedInstall {
             // copy — the one that will be needed if this version turns out to
             // crash. Regaining a newer version later is cheap; losing the
             // fallback is not.
-            if let active = activeSlot, let activeInfo = self.state.slots[active],
-                let verified = activeInfo.verifiedAt,
-                Date().timeIntervalSince(verified) < Self.earlyExitSeconds,
-                self.state.slots[target]?.isUsable == true
-            {
+            let targetIsFallback = self.withState { () -> Bool in
+                guard let active = activeSlot, let activeInfo = self.state.slots[active],
+                    let verified = activeInfo.verifiedAt,
+                    Date().timeIntervalSince(verified) < Self.earlyExitSeconds
+                else { return false }
+                return self.state.slots[target]?.isUsable == true
+            }
+            if targetIsFallback, let active = activeSlot {
                 Log.shared.write(
                     "update deferred: slot \(active) is still on trial and slot \(target) is the fallback")
-                return completion(.deferredTrial)
+                return finish(.deferredTrial)
             }
 
             // Already have this version staged and verified? Nothing to do.
-            if let existing = self.state.slots[target], existing.version == wanted,
-                existing.verifiedAt != nil, !existing.broken,
-                FileManager.default.isExecutableFile(atPath: AppPaths.slotBinary(target).path)
-            {
+            let alreadyStaged = self.withState { () -> Bool in
+                guard let existing = self.state.slots[target], existing.version == wanted,
+                    existing.verifiedAt != nil, !existing.broken
+                else { return false }
+                return FileManager.default.isExecutableFile(atPath: AppPaths.slotBinary(target).path)
+            }
+            if alreadyStaged {
                 Log.shared.write("update: slot \(target) already holds \(wanted)")
-                DispatchQueue.main.async {
-                    self.markStaged(target, version: wanted, activeSlot: activeSlot)
-                    completion(.staged(wanted))
-                }
-                return
+                self.markStaged(target, version: wanted, activeSlot: activeSlot)
+                return finish(.staged(wanted))
             }
 
             Log.shared.write("update: installing \(wanted) into slot \(target)")
@@ -640,7 +690,7 @@ final class ManagedInstall {
                     Log.shared.write("update: install failed; keeping the running version")
                     self.discard(target)
                     self.save()
-                    return completion(.unavailable("the download or install failed"))
+                    return finish(.unavailable("the download or install failed"))
                 }
 
                 // Prove the new copy boots and serves the GUI before trusting it.
@@ -648,34 +698,38 @@ final class ManagedInstall {
                 Log.shared.write("update: verifying slot \(target)")
                 let verdict = Self.healthCheck(dsh: binary)
 
-                DispatchQueue.main.async {
-                    guard verdict == nil else {
-                        Log.shared.write("update: slot \(target) failed verification (\(verdict!)); discarding")
-                        // Remember the version, not just the slot: there is no
-                        // point downloading a release that cannot start again
-                        // on the next launch.
-                        self.state.rejected[wanted] = verdict!
-                        self.discard(target)
-                        self.save()
-                        return completion(.unavailable(verdict))
-                    }
-                    // It started, so drop any earlier bad verdict for it.
+                // It started, so record it. Reading the verdict and writing the
+                // outcome happen together, so a crash report arriving from the
+                // main queue cannot interleave between the two.
+                if let verdict {
+                    Log.shared.write("update: slot \(target) failed verification (\(verdict)); discarding")
+                    // Remember the version, not just the slot: there is no
+                    // point downloading a release that cannot start again
+                    // on the next launch.
+                    self.withState { self.state.rejected[wanted] = verdict }
+                    self.discard(target)
+                    self.save()
+                    return finish(.unavailable(verdict))
+                }
+                self.withState {
                     self.state.rejected[wanted] = nil
                     self.state.slots[target] = Slot(
                         version: wanted, installedAt: Date(), verifiedAt: Date(), broken: false)
-                    self.markStaged(target, version: wanted, activeSlot: activeSlot)
-                    Log.shared.write("update: \(wanted) verified in slot \(target), ready for next launch")
-                    completion(.staged(wanted))
                 }
+                self.markStaged(target, version: wanted, activeSlot: activeSlot)
+                Log.shared.write("update: \(wanted) verified in slot \(target), ready for next launch")
+                return finish(.staged(wanted))
             }
         }
     }
 
     private func markStaged(_ target: String, version: String, activeSlot: String?) {
-        self.state.staged = target
-        // When nothing has been booted from a slot yet, this becomes the boot slot.
-        if self.state.preferred == nil { self.state.preferred = target }
-        self.state.updatedAt = Date()
+        withState {
+            self.state.staged = target
+            // When nothing has been booted from a slot yet, this becomes the boot slot.
+            if self.state.preferred == nil { self.state.preferred = target }
+            self.state.updatedAt = Date()
+        }
         self.save()
     }
 
@@ -771,101 +825,206 @@ final class ManagedInstall {
     /// Returns true when this completes a crash loop, meaning the caller should
     /// abandon this version and switch slots.
     func recordEarlyExit(slot: String?, uptime: TimeInterval) -> Bool {
-        guard let slot, isEnabled, let existing = state.slots[slot] else { return false }
-        // Only a quick death implicates the version. Something that ran for a
-        // good while and then stopped is not evidence about the release.
-        guard uptime < Self.earlyExitSeconds else {
-            if !existing.earlyExits.isEmpty {
-                Log.shared.write("slot \(slot) ran \(Int(uptime))s; clearing its crash history")
-                state.slots[slot]?.earlyExits = []
-                save()
-            }
-            return false
+        guard let slot, isEnabled else { return false }
+
+        /// What the locked section decided, so the logging and the disk write
+        /// happen outside it.
+        enum Verdict {
+            case noRecord
+            case staleCleared
+            case notEvidence
+            case recorded(count: Int)
         }
 
-        var recent = existing.recentEarlyExits(window: Self.crashWindow)
-        recent.append(Date())
-        state.slots[slot]?.earlyExits = recent
-        save()
+        // Read, decide, and write under a single acquisition: a crash report and
+        // an update's state write must not interleave, or one of them is lost.
+        let verdict = withState { () -> Verdict in
+            guard let existing = state.slots[slot] else { return .noRecord }
 
-        Log.shared.write(
-            "slot \(slot) exited after \(Int(uptime))s; \(recent.count) of \(Self.crashLoopLimit) early exits in the window")
-        return recent.count >= Self.crashLoopLimit
+            // Only a quick death implicates the version. Something that ran for a
+            // good while and then stopped is not evidence about the release.
+            guard uptime < Self.earlyExitSeconds else {
+                guard !existing.earlyExits.isEmpty else { return .notEvidence }
+                state.slots[slot]?.earlyExits = []
+                return .staleCleared
+            }
+
+            var recent = existing.recentEarlyExits(window: Self.crashWindow)
+            recent.append(Date())
+            state.slots[slot]?.earlyExits = recent
+            return .recorded(count: recent.count)
+        }
+
+        switch verdict {
+        case .noRecord, .notEvidence:
+            return false
+        case .staleCleared:
+            Log.shared.write("slot \(slot) ran \(Int(uptime))s; clearing its crash history")
+            save()
+            return false
+        case .recorded(let count):
+            save()
+            Log.shared.write(
+                "slot \(slot) exited after \(Int(uptime))s; \(count) of \(Self.crashLoopLimit) early exits in the window")
+            return count >= Self.crashLoopLimit
+        }
     }
 
     /// The version currently designated to boot, for messages.
     func version(of slot: String?) -> String? {
         guard let slot else { return nil }
-        return state.slots[slot]?.version
+        return withState { state.slots[slot]?.version }
     }
 
     /// Mark a slot as having proven itself: it served, and it kept serving for
     /// long enough that it is no longer a crash-loop suspect.
     func recordStable(slot: String?) {
-        guard let slot, isEnabled, state.slots[slot] != nil else { return }
-        if !(state.slots[slot]?.earlyExits.isEmpty ?? true) {
-            Log.shared.write("slot \(slot) proved stable; clearing its crash history")
+        withState {
+            guard let slot, isEnabled, state.slots[slot] != nil else { return }
+            if !(state.slots[slot]?.earlyExits.isEmpty ?? true) {
+                Log.shared.write("slot \(slot) proved stable; clearing its crash history")
+            }
+            state.slots[slot]?.earlyExits = []
+            state.slots[slot]?.verifiedAt = Date()
         }
-        state.slots[slot]?.earlyExits = []
-        state.slots[slot]?.verifiedAt = Date()
         save()
     }
 
     /// Whether the idle slot currently holds a usable copy of the harness — the
     /// one that would be lost if an update overwrote it.
     func idleSlotIsFallback(activeSlot: String?) -> Bool {
-        state.slots[state.other(than: activeSlot)]?.isUsable == true
+        withState { state.slots[state.other(than: activeSlot)]?.isUsable == true }
     }
 
+    /// The slot the next boot should use, for callers that only need to look.
+    var preferredSlot: String? { withState { state.preferred } }
+
+    /// The slot holding a verified update waiting for the next launch.
+    var stagedSlot: String? { withState { state.staged } }
+
     /// Test seam: install a slot record directly.
-    func setSlot(_ name: String, _ slot: Slot) { state.slots[name] = slot }
+    func setSlot(_ name: String, _ slot: Slot) { withState { state.slots[name] = slot } }
 
     /// Boot a candidate copy on an ephemeral port and confirm it really serves
     /// the GUI. This is the gate every update must pass before it can be booted,
     /// and it is what makes a broken upstream commit a non-event.
     ///
     /// Returns nil when healthy, or a short reason when not.
+    ///
+    /// This runs on `ManagedInstall`'s background queue and blocks it until the
+    /// candidate answers, so it is deliberately self-contained: it drives its
+    /// own `HarnessServer` on a private queue and polls two `Handoff` boxes.
+    /// Nothing here touches the main queue or needs a run loop, which matters
+    /// because there is no main-queue pump during an update and because the
+    /// caller may itself be the main thread (the tests call it that way).
     static func healthCheck(dsh: String, timeout: TimeInterval = 120) -> String? {
-        let server = HarnessServer()
-        var ready: URL?
-        var failure: String?
-        server.onReady = { ready = $0 }
-        server.onFailure = { reason, _ in failure = reason }
-        server.start(preferredPort: 0, dsh: dsh)
+        let queue = DispatchQueue(label: "dsh.health-check")
+        let server = HarnessServer(callbackQueue: queue)
+        let ready = Handoff<URL>()
+        let failure = Handoff<String>()
 
-        let deadline = Date().addingTimeInterval(timeout)
-        while ready == nil && failure == nil && Date() < deadline {
-            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.1))
+        // Start on the server's own queue so its threading contract holds.
+        queue.sync {
+            server.onReady = { ready.set($0) }
+            server.onFailure = { reason, _ in failure.set(reason) }
+            server.start(preferredPort: 0, dsh: dsh)
         }
 
-        guard let url = ready else {
-            server.stop()
+        func awaitOutcome(until deadline: Date) -> String? {
+            while Date() < deadline {
+                if ready.value != nil { return nil }
+                if let reason = failure.value { return reason }
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            return nil
+        }
+
+        let startupDeadline = Date().addingTimeInterval(timeout)
+        let failed = awaitOutcome(until: startupDeadline)
+
+        guard let url = ready.value else {
+            queue.sync { server.stop() }
             // Keep the tail of the output: that is where Node puts the actual
             // error, and it is what makes a failed update diagnosable.
             return Locator.condense(
-                failure ?? "no listening port within \(Int(timeout))s")
+                failed ?? "no listening port within \(Int(timeout))s")
         }
 
-        var status: Int?
+        let status = Handoff<Int>()
+        let httpDone = DispatchSemaphore(value: 0)
         let task = URLSession.shared.dataTask(with: url) { _, response, _ in
-            status = (response as? HTTPURLResponse)?.statusCode
+            if let code = (response as? HTTPURLResponse)?.statusCode { status.set(code) }
+            httpDone.signal()
         }
         task.resume()
-        let httpDeadline = Date().addingTimeInterval(30)
-        while status == nil && Date() < httpDeadline {
-            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.1))
-        }
-        server.stop()
+        // The semaphore supplies the ordering the old captured-`var` read did
+        // not have: the write in the completion happens-before this returns.
+        _ = httpDone.wait(timeout: .now() + 30)
 
-        guard status == 200 else { return "the GUI returned \(status.map(String.init) ?? "no response")" }
+        queue.sync { server.stop() }
+
+        guard let code = status.value else { return "the GUI did not respond" }
+        guard code == 200 else { return "the GUI returned \(code)" }
         return nil
     }
 }
 
 // MARK: - Server process
 
+/// A value handed from a callback thread to a waiting thread.
+///
+/// The obvious spelling — a captured `var` written in a completion handler and
+/// read by the thread that waits — is a data race, and one this code actually
+/// had. `URLSession` delivers its completion on its own queue while the caller
+/// polls, so the two accesses are genuinely concurrent and unsynchronized; that
+/// it usually happens to work is luck, not ordering. Swift 6 flags the pattern
+/// statically, and ThreadSanitizer reports it at runtime.
+///
+/// The lock makes the hand-off explicit. It is deliberately tiny: a lock is the
+/// right tool here precisely because the critical section is one assignment, and
+/// callers need to poll without blocking on a queue.
+final class Handoff<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: T?
+
+    init() {}
+
+    func set(_ value: T) {
+        lock.lock()
+        stored = value
+        lock.unlock()
+    }
+
+    var value: T? {
+        lock.lock()
+        defer { lock.unlock() }
+        return stored
+    }
+}
+
 /// Owns one `dsh web` child process for the lifetime of the window.
+///
+/// ## Threading
+///
+/// Every stored property is touched only on `callbackQueue`: `start`, `stop`,
+/// the pipe handlers, the termination handler, and the startup ceiling all run
+/// there, and `onReady`/`onFailure` are delivered there. The default is the main
+/// queue, which is what the app wants — the UI owns the server, and the server
+/// owns a child process whose teardown can block for seconds.
+///
+/// `healthCheck` is the one caller that needs something else. It runs on a
+/// background queue during an update and must block until it has an answer, so
+/// it gives its server a private queue and polls the result. That is also why
+/// the startup ceiling below is scheduled on `callbackQueue` rather than on the
+/// main queue directly: a health check has no main-queue pump of its own, and
+/// scheduling onto a queue nobody is draining would silently drop the timeout.
 final class HarnessServer {
+    private let callbackQueue: DispatchQueue
+
+    init(callbackQueue: DispatchQueue = .main) {
+        self.callbackQueue = callbackQueue
+    }
+
     /// URL line the web bundle prints once the server has bound its port:
     /// `dsh web: http://127.0.0.1:<port>/?token=<process token>`
     private static let readyMarker = "dsh web: "
@@ -965,17 +1124,20 @@ final class HarnessServer {
         stdout.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-            DispatchQueue.main.async { self?.ingest(stdout: text, generation: token) }
+            guard let self else { return }
+            self.callbackQueue.async { self.ingest(stdout: text, generation: token) }
         }
         stderr.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-            DispatchQueue.main.async { self?.ingest(stderr: text, generation: token) }
+            guard let self else { return }
+            self.callbackQueue.async { self.ingest(stderr: text, generation: token) }
         }
 
         child.terminationHandler = { [weak self] exited in
-            DispatchQueue.main.async {
-                guard let self, self.generation == token else { return }
+            guard let self else { return }
+            self.callbackQueue.async {
+                guard self.generation == token else { return }
                 self.detachPipes()
                 self.isRunning = false
                 let status = exited.terminationStatus
@@ -1005,8 +1167,9 @@ final class HarnessServer {
         Log.shared.write("dsh started with pid \(child.processIdentifier)")
 
         // Startup ceiling: a hung or misconfigured harness must not leave a
-        // spinner forever.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 120) { [weak self] in
+        // spinner forever. Scheduled on the callback queue, not the main queue
+        // directly, so a health check on a private queue still gets its timeout.
+        callbackQueue.asyncAfter(deadline: .now() + 120) { [weak self] in
             guard let self, self.generation == token, !self.readySeen else { return }
             self.onFailure?("The Harness did not report a listening port within 120s.\n\n\(self.recentLog())", true)
         }
@@ -1361,21 +1524,47 @@ final class StatusOverlay: NSView {
     }
 }
 
-// MARK: - Application
+// MARK: - Lifecycle
 
-final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate {
-    private var window: NSWindow!
-    private var webView: WKWebView!
-    private var overlay: StatusOverlay!
-    private let server = HarnessServer()
+/// What the lifecycle asks the window to show.
+///
+/// The lifecycle decides *what should happen* — which copy to boot, when to
+/// abandon a version, when to check for an update — and the delegate decides
+/// how that looks. Keeping the two apart is what stops the update rules from
+/// being tangled up with the views that report them, and it is where the
+/// threading contract lives: every one of these is called on the main queue.
+protocol HarnessLifecycleUIDelegate: AnyObject {
+    func lifecycleShowWorking(_ title: String, detail: String)
+    func lifecycleShowFailure(_ reason: String)
+    func lifecycleDidLoad(url: URL)
+    func lifecycleShowBanner(title: String, detail: String, kind: NoticeCard.Kind)
+    func lifecycleDismissBanner()
+    func lifecycleDidStageUpdate(version: String)
+    func lifecycleDidRollBack(
+        failed: String, recovered: String, reason: String, cause: HarnessLifecycle.RollbackCause)
+}
+
+/// Decides which harness to run, keeps it running, and recovers when it cannot.
+///
+/// This is the half of the old `AppDelegate` that had nothing to do with AppKit:
+/// booting a copy, watching it, attributing a failure to a version, and
+/// promoting or abandoning slots. It owns the server and the installed state;
+/// it owns no views.
+///
+/// ## Threading
+///
+/// Main queue only. Every entry point is called from AppKit, `HarnessServer`
+/// delivers its callbacks on the main queue, and `ManagedInstall` is separately
+/// thread-safe for the work it does on its own queue.
+final class HarnessLifecycle {
+    weak var delegate: HarnessLifecycleUIDelegate?
+
     /// The token-bearing URL, kept so Reload re-authenticates rather than
     /// hitting a 401 on the clean root.
-    private var authenticatedURL: URL?
-    /// Retained so the signal handlers stay installed.
-    private var signalSources: [DispatchSourceSignal] = []
-    /// True from the moment a start begins until that start succeeds or fails.
-    /// Retry and menu actions are cheap to trigger twice (a stray Return, a
-    /// double click), and a second concurrent server would fight for the port.
+    private(set) var authenticatedURL: URL?
+
+    private let server = HarnessServer()
+    private let managed = ManagedInstall()
     private var isStarting = false
     /// The managed slot currently being booted, so a startup failure can be
     /// attributed to a specific installed version.
@@ -1390,7 +1579,292 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     /// The pending background update, cancelled and rescheduled whenever a new
     /// server starts.
     private var updateWorkItem: DispatchWorkItem?
-    private let managed = ManagedInstall()
+    private let preferredPort: Int
+
+    init(preferredPort: Int = HarnessLifecycle.defaultPort) {
+        self.preferredPort = preferredPort
+        wireServer()
+    }
+
+    static var defaultPort: Int {
+        let raw = ProcessInfo.processInfo.environment["DSH_WRAPPER_PORT"] ?? ""
+        return Int(raw).flatMap { $0 > 0 && $0 < 65536 ? $0 : nil } ?? 3080
+    }
+
+    var managedUpdatesEnabled: Bool { managed.isEnabled }
+
+    /// Whether a harness process is currently up, for the window's own
+    /// navigation-failure message.
+    var isServerRunning: Bool { server.isRunning }
+
+    /// The tail of the harness output, for that same message.
+    var recentServerLog: String { server.recentLog() }
+
+    /// Why a version is being abandoned, which decides how it is explained.
+    enum RollbackCause {
+        /// The harness never reported a listening port.
+        case failedToStart
+        /// It served, then died soon after, repeatedly.
+        case crashLoop
+    }
+
+    // MARK: Server callbacks
+
+    private func wireServer() {
+        server.onReady = { [weak self] url in
+            guard let self else { return }
+            self.isStarting = false
+            self.authenticatedURL = url
+            self.readyAt = Date()
+            // This copy demonstrably boots and serves, so record it as good and,
+            // if it was a staged update, make it the version we return to.
+            // Only a real slot promotion counts. Comparing optionals directly
+            // would treat "no slot at all" as a promotion, since nil == nil.
+            let promoted = self.bootingSlot.map { self.managed.stagedSlot == $0 } ?? false
+            self.managed.recordHealthy(slot: self.bootingSlot)
+            if promoted { Log.shared.write("running the newly installed harness") }
+            self.runningSlot = self.bootingSlot
+            self.bootingSlot = nil
+            self.delegate?.lifecycleDismissBanner()
+            self.delegate?.lifecycleDidLoad(url: url)
+            self.updateIdleSlotInBackground()
+        }
+        server.onFailure = { [weak self] reason, atStartup in
+            guard let self else { return }
+            self.isStarting = false
+            // Mirror to the log: the overlay is easy to miss, and a startup
+            // failure is precisely what someone reads the log to explain.
+            Log.shared.write("start failure (atStartup=\(atStartup)): \(reason)")
+
+            guard self.managed.isEnabled else { return self.showFailure(reason) }
+
+            if atStartup {
+                // It never served, so the version itself is the suspect.
+                if let failed = self.bootingSlot {
+                    self.rollBack(from: failed, reason: reason, cause: .failedToStart)
+                } else {
+                    self.showFailure(reason)
+                }
+                return
+            }
+
+            // It was serving and then stopped. A version that dies soon after
+            // starting is just as broken as one that never starts, so count
+            // those and switch slots once they repeat; a long healthy run
+            // followed by a stop is treated as transient and simply restarted.
+            let uptime = self.readyAt.map { Date().timeIntervalSince($0) } ?? .greatestFiniteMagnitude
+            if let slot = self.runningSlot,
+                self.managed.recordEarlyExit(slot: slot, uptime: uptime)
+            {
+                self.rollBack(from: slot, reason: reason, cause: .crashLoop)
+                return
+            }
+
+            if self.runningSlot != nil {
+                self.delegate?.lifecycleShowBanner(
+                    title: "The Harness stopped unexpectedly — restarting it",
+                    detail: """
+                        \(reason.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? reason)
+                        If this keeps happening, the app will switch back to the previous version automatically.
+                        """,
+                    kind: .warning)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                    self?.start(reason: "auto-restart after an unexpected exit", force: true)
+                }
+                return
+            }
+            self.showFailure(reason)
+        }
+    }
+
+    private func showFailure(_ reason: String) {
+        delegate?.lifecycleShowFailure(reason)
+    }
+
+    /// Automatic recovery: mark the failed copy unusable, boot the other one,
+    /// and tell the user plainly what happened and which version they are on.
+    private func rollBack(from failedSlot: String, reason: String, cause: RollbackCause) {
+        let failedVersion = managed.version(of: failedSlot) ?? "the updated harness"
+        managed.recordBroken(slot: failedSlot, reason: reason)
+        runningSlot = nil
+
+        guard let next = managed.resolveBootCandidate(), next.slot != failedSlot else {
+            // Nothing left to fall back to: report the original failure.
+            showFailure(managed.isEnabled
+                ? "Neither installed copy of the Harness could start.\n\n\(reason)"
+                : reason)
+            return
+        }
+
+        let recoveredVersion = next.slot.flatMap { managed.version(of: $0) } ?? "your system install"
+        Log.shared.write("rolled back from \(failedVersion) to \(recoveredVersion)")
+
+        delegate?.lifecycleDidRollBack(
+            failed: failedVersion, recovered: recoveredVersion, reason: reason, cause: cause)
+        launch(dsh: next.dsh, slot: next.slot)
+    }
+
+    // MARK: Starting
+
+    func start(reason: String, force: Bool = false) {
+        if isStarting && !force {
+            Log.shared.write("ignoring start request (\(reason)): one is already in flight")
+            return
+        }
+        isStarting = true
+        Log.shared.write("start requested by: \(reason)")
+
+        guard managed.isEnabled else {
+            // Unmanaged: use whatever `dsh` the user has, exactly as before.
+            guard let dsh = Locator.dshPath() else {
+                showFailure("""
+                    Could not find the `dsh` command.
+
+                    Install it with:  npm i -g @deepseek-ai/dsh
+                    Or point this app at an existing copy with the DSH_BIN environment variable.
+                    """)
+                return
+            }
+            launch(dsh: dsh, slot: nil)
+            return
+        }
+
+        if let candidate = managed.resolveBootCandidate() {
+            // A candidate with no slot means it came from PATH. That is the
+            // first-run case: use the harness already installed so the launch is
+            // instant rather than a download, and provision a managed slot in
+            // the background once it is serving. This is also what makes
+            // switching to this app non-destructive — the first run behaves
+            // exactly like whatever you were using before.
+            if candidate.slot == nil {
+                Log.shared.write(
+                    "no managed slot yet; booting the installed dsh and provisioning one in the background")
+            }
+            launch(dsh: candidate.dsh, slot: candidate.slot)
+            return
+        }
+
+        // Nothing installed anywhere: the first run has to fetch one.
+        provisionFirstSlot()
+    }
+
+    /// Boot a specific copy of the harness.
+    private func launch(dsh: String, slot: String?) {
+        bootingSlot = slot
+        readyAt = nil
+        // Name the exact copy being started: when two versions are in play, the
+        // log is how you tell which one you were actually running.
+        if let slot {
+            let version = managed.version(of: slot) ?? "?"
+            Log.shared.write("booting managed slot \(slot) (harness \(version)): \(dsh)")
+        } else {
+            Log.shared.write("booting the harness from PATH: \(dsh)")
+        }
+        let detail = slot.map { "managed slot \($0)" } ?? "your installed dsh"
+        delegate?.lifecycleShowWorking("Starting DeepSeek Harness…", detail: detail)
+        server.start(preferredPort: preferredPort, dsh: dsh)
+    }
+
+    /// Install the first managed copy. Only reached when no copy is usable, so
+    /// it is normally a one-time, first-run step.
+    private func provisionFirstSlot() {
+        delegate?.lifecycleShowWorking(
+            "Installing DeepSeek Harness…",
+            detail: "fetching the harness into a managed slot (first run only)")
+        managed.updateIdleSlot(activeSlot: nil) { [weak self] outcome in
+            guard let self else { return }
+            guard let candidate = self.managed.resolveBootCandidate() else {
+                self.showFailure("""
+                    Could not install DeepSeek Harness.
+
+                    \(outcome.failureReason ?? "The first run needs network access to fetch it.")
+                    If you would rather use a harness you already have, launch with DSH_MANAGED=0.
+                    """)
+                return
+            }
+            Log.shared.write("provisioned harness \(outcome.stagedVersion ?? "?")")
+            self.launch(dsh: candidate.dsh, slot: candidate.slot)
+        }
+    }
+
+    func stop() {
+        server.stop()
+    }
+
+    func cancelInstaller() {
+        managed.cancelInstaller()
+    }
+
+    // MARK: Updates
+
+    /// Stage the newest version into the idle slot while the app runs, so the
+    /// next launch starts the new harness and can still fall back to this one.
+    ///
+    /// Deliberately waits until the running version has been up for the trial
+    /// period. The idle slot is the fallback, and an update replaces its
+    /// contents — so updating it while a freshly installed version is still on
+    /// trial would destroy the only known-good copy at exactly the moment it
+    /// might be needed. Only once the running version has proven it stays up
+    /// does the other slot become expendable.
+    private func updateIdleSlotInBackground() {
+        guard managed.isEnabled, managed.autoUpdateEnabled else { return }
+        updateWorkItem?.cancel()
+
+        let slot = runningSlot ?? managed.preferredSlot
+        // The trial wait exists to protect the fallback, so it only applies when
+        // there is one. A first run with nothing installed yet can start right
+        // away.
+        let elapsed = readyAt.map { Date().timeIntervalSince($0) } ?? 0
+        let wait = managed.idleSlotIsFallback(activeSlot: slot)
+            ? max(ManagedInstall.earlyExitSeconds - elapsed, 5)
+            : 5
+
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.managed.recordStable(slot: slot)
+            self.managed.updateIdleSlot(activeSlot: slot) { [weak self] outcome in
+                guard let self, let version = outcome.stagedVersion else { return }
+                self.delegate?.lifecycleDidStageUpdate(version: version)
+            }
+        }
+        updateWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + wait, execute: item)
+    }
+
+    /// Bring the idle slot up to date at the user's request. The outcome is
+    /// handed back for the caller to explain; the lifecycle has no opinion about
+    /// what a "not yet" looks like on screen.
+    func checkForUpdates(completion: @escaping (UpdateOutcome) -> Void) {
+        managed.updateIdleSlot(activeSlot: runningSlot ?? managed.preferredSlot, force: true) {
+            [weak self] outcome in
+            guard self != nil else { return }
+            completion(outcome)
+        }
+    }
+
+    /// Ask for the idle slot to be reinstalled, so its outcome is `staged` even
+    /// when it was already newest.
+    func reinstallIdleSlot(completion: @escaping (UpdateOutcome) -> Void) {
+        checkForUpdates(completion: completion)
+    }
+}
+
+// MARK: - Application
+
+/// The window, the menu, and the notice cards.
+///
+/// Everything about *how the app looks and responds*; everything about *which
+/// harness runs and what happens when it does not* is `HarnessLifecycle`. The
+/// two meet at `HarnessLifecycleUIDelegate`.
+final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, WKUIDelegate,
+    HarnessLifecycleUIDelegate
+{
+    private var window: NSWindow!
+    private var webView: WKWebView!
+    private var overlay: StatusOverlay!
+    private lazy var lifecycle = HarnessLifecycle()
+    /// Retained so the signal handlers stay installed.
+    private var signalSources: [DispatchSourceSignal] = []
     /// The floating notice currently on screen, if any.
     private var banner: NoticeCard?
     /// Pending auto-dismiss for an informational notice.
@@ -1398,17 +1872,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     /// Set when the app is rendering itself to a file for documentation.
     private var pendingScreenshot: ScreenshotRequest?
 
-    private var preferredPort: Int {
-        let raw = ProcessInfo.processInfo.environment["DSH_WRAPPER_PORT"] ?? ""
-        return Int(raw).flatMap { $0 > 0 && $0 < 65536 ? $0 : nil } ?? 3080
+    // MARK: Lifecycle delegate
+
+    func lifecycleShowWorking(_ title: String, detail: String) {
+        overlay.showWorking(title, detail: detail)
     }
+
+    func lifecycleShowFailure(_ reason: String) {
+        let split = reason.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
+        overlay.showFailure(
+            String(split.first ?? "The Harness could not start."),
+            detail: split.count > 1 ? String(split[1]) : "")
+    }
+
+    func lifecycleDidLoad(url: URL) {
+        webView.load(URLRequest(url: url))
+    }
+
+    func lifecycleShowBanner(title: String, detail: String, kind: NoticeCard.Kind) {
+        showBanner(title, detail: detail, kind: kind)
+    }
+
+    func lifecycleDismissBanner() {
+        dismissBanner()
+    }
+
+    func lifecycleDidStageUpdate(version: String) {
+        reportUpdateStaged(version)
+    }
+
+    func lifecycleDidRollBack(
+        failed: String, recovered: String, reason: String, cause: HarnessLifecycle.RollbackCause
+    ) {
+        alertRollback(failed: failed, recovered: recovered, reason: reason, cause: cause)
+    }
+
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Log.shared.write("launched; log at \(Log.shared.logPath)")
         installSignalHandlers()
         buildMenu()
         buildWindow()
-        wireServer()
+        lifecycle.delegate = self
 
         // Documentation mode: the app renders its own window to a file. This is
         // how the README's screenshots are produced without depending on screen
@@ -1420,7 +1925,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             window.setContentSize(NSSize(width: 1280, height: 820))
         }
 
-        startHarness("app launch")
+        lifecycle.start(reason: "app launch")
         NSApp.activate(ignoringOtherApps: true)
     }
 
@@ -1574,7 +2079,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
             source.setEventHandler { [weak self] in
                 Log.shared.write("received signal \(number); shutting down")
-                self?.server.stop()
+                self?.lifecycle.stop()
                 NSApp.terminate(nil)
             }
             source.resume()
@@ -1584,8 +2089,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
 
     func applicationWillTerminate(_ notification: Notification) {
         // Stop a half-finished install so the next launch starts from a clean slot.
-        managed.cancelInstaller()
-        server.stop()
+        lifecycle.cancelInstaller()
+        lifecycle.stop()
         Log.shared.write("quit")
     }
 
@@ -1639,236 +2144,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
         window.makeKeyAndOrderFront(nil)
     }
 
-    private func wireServer() {
-        server.onReady = { [weak self] url in
-            guard let self else { return }
-            self.isStarting = false
-            self.authenticatedURL = url
-            self.readyAt = Date()
-            // This copy demonstrably boots and serves, so record it as good and,
-            // if it was a staged update, make it the version we return to.
-            // Only a real slot promotion counts. Comparing optionals directly
-            // would treat "no slot at all" as a promotion, since nil == nil.
-            let promoted = self.bootingSlot.map { self.managed.state.staged == $0 } ?? false
-            self.managed.recordHealthy(slot: self.bootingSlot)
-            if promoted { self.reportUpdateAdopted() }
-            self.runningSlot = self.bootingSlot
-            self.bootingSlot = nil
-            self.dismissBanner()
-            self.webView.load(URLRequest(url: url))
-            self.updateIdleSlotInBackground()
-        }
-        server.onFailure = { [weak self] reason, atStartup in
-            guard let self else { return }
-            self.isStarting = false
-            // Mirror to the log: the overlay is easy to miss, and a startup
-            // failure is precisely what someone reads the log to explain.
-            Log.shared.write("start failure (atStartup=\(atStartup)): \(reason)")
 
-            guard self.managed.isEnabled else { return self.showFailure(reason) }
+    // MARK: Menu actions
 
-            if atStartup {
-                // It never served, so the version itself is the suspect.
-                if let failed = self.bootingSlot {
-                    self.rollBack(from: failed, reason: reason, cause: .failedToStart)
-                } else {
-                    self.showFailure(reason)
-                }
-                return
-            }
+    @objc private func retryStartup() { lifecycle.start(reason: "retry button") }
 
-            // It was serving and then stopped. A version that dies soon after
-            // starting is just as broken as one that never starts, so count
-            // those and switch slots once they repeat; a long healthy run
-            // followed by a stop is treated as transient and simply restarted.
-            let uptime = self.readyAt.map { Date().timeIntervalSince($0) } ?? .greatestFiniteMagnitude
-            if let slot = self.runningSlot,
-                self.managed.recordEarlyExit(slot: slot, uptime: uptime)
-            {
-                self.rollBack(from: slot, reason: reason, cause: .crashLoop)
-                return
-            }
-
-            if self.runningSlot != nil {
-                self.showBanner(
-                    "The Harness stopped unexpectedly — restarting it",
-                    detail: """
-                        \(reason.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) ?? reason)
-                        If this keeps happening, the app will switch back to the previous version automatically.
-                        """,
-                    kind: .warning)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
-                    self?.startHarness("auto-restart after an unexpected exit", force: true)
-                }
-                return
-            }
-            self.showFailure(reason)
-        }
-    }
-
-    private func showFailure(_ reason: String) {
-        let split = reason.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
-        overlay.showFailure(
-            String(split.first ?? "The Harness could not start."),
-            detail: split.count > 1 ? String(split[1]) : "")
-    }
-
-    /// Why a version is being abandoned, which decides how it is explained.
-    enum RollbackCause {
-        /// The harness never reported a listening port.
-        case failedToStart
-        /// It served, then died soon after, repeatedly.
-        case crashLoop
-    }
-
-    /// Automatic recovery: mark the failed copy unusable, boot the other one,
-    /// and tell the user plainly what happened and which version they are on.
-    private func rollBack(from failedSlot: String, reason: String, cause: RollbackCause) {
-        let failedVersion = managed.version(of: failedSlot) ?? "the updated harness"
-        managed.recordBroken(slot: failedSlot, reason: reason)
-        runningSlot = nil
-
-        guard let next = managed.resolveBootCandidate(), next.slot != failedSlot else {
-            // Nothing left to fall back to: report the original failure.
-            showFailure(managed.isEnabled
-                ? "Neither installed copy of the Harness could start.\n\n\(reason)"
-                : reason)
-            return
-        }
-
-        let recoveredVersion = next.slot.flatMap { managed.version(of: $0) } ?? "your system install"
-        Log.shared.write("rolled back from \(failedVersion) to \(recoveredVersion)")
-
-        alertRollback(
-            failed: failedVersion, recovered: recoveredVersion, reason: reason, cause: cause)
-        launch(dsh: next.dsh, slot: next.slot)
-    }
-
-    // MARK: Managed updates
-
-    private func startHarness(_ reason: String, force: Bool = false) {
-        if isStarting && !force {
-            Log.shared.write("ignoring start request (\(reason)): one is already in flight")
-            return
-        }
-        isStarting = true
-        Log.shared.write("start requested by: \(reason)")
-
-        guard managed.isEnabled else {
-            // Unmanaged: use whatever `dsh` the user has, exactly as before.
-            guard let dsh = Locator.dshPath() else {
-                showFailure("""
-                    Could not find the `dsh` command.
-
-                    Install it with:  npm i -g @deepseek-ai/dsh
-                    Or point this app at an existing copy with the DSH_BIN environment variable.
-                    """)
-                return
-            }
-            launch(dsh: dsh, slot: nil)
-            return
-        }
-
-        if let candidate = managed.resolveBootCandidate() {
-            // A candidate with no slot means it came from PATH. That is the
-            // first-run case: use the harness already installed so the launch is
-            // instant rather than a download, and provision a managed slot in
-            // the background once it is serving. This is also what makes
-            // switching to this app non-destructive — the first run behaves
-            // exactly like whatever you were using before.
-            if candidate.slot == nil {
-                Log.shared.write(
-                    "no managed slot yet; booting the installed dsh and provisioning one in the background")
-            }
-            launch(dsh: candidate.dsh, slot: candidate.slot)
-            return
-        }
-
-        // Nothing installed anywhere: the first run has to fetch one.
-        provisionFirstSlot()
-    }
-
-    /// Boot a specific copy of the harness.
-    private func launch(dsh: String, slot: String?) {
-        bootingSlot = slot
-        readyAt = nil
-        // Name the exact copy being started: when two versions are in play, the
-        // log is how you tell which one you were actually running.
-        if let slot {
-            let version = managed.version(of: slot) ?? "?"
-            Log.shared.write("booting managed slot \(slot) (harness \(version)): \(dsh)")
-        } else {
-            Log.shared.write("booting the harness from PATH: \(dsh)")
-        }
-        let detail = slot.map { "managed slot \($0)" } ?? "your installed dsh"
-        overlay.showWorking("Starting DeepSeek Harness…", detail: detail)
-        server.start(preferredPort: preferredPort, dsh: dsh)
-    }
-
-    /// Install the first managed copy. Only reached when no copy is usable, so
-    /// it is normally a one-time, first-run step.
-    private func provisionFirstSlot() {
-        overlay.showWorking(
-            "Installing DeepSeek Harness…",
-            detail: "fetching the harness into a managed slot (first run only)")
-        managed.updateIdleSlot(activeSlot: nil) { [weak self] outcome in
-            guard let self else { return }
-            guard let candidate = self.managed.resolveBootCandidate() else {
-                self.showFailure("""
-                    Could not install DeepSeek Harness.
-
-                    \(outcome.failureReason ?? "The first run needs network access to fetch it.")
-                    If you would rather use a harness you already have, launch with DSH_MANAGED=0.
-                    """)
-                return
-            }
-            Log.shared.write("provisioned harness \(outcome.stagedVersion ?? "?")")
-            self.launch(dsh: candidate.dsh, slot: candidate.slot)
-        }
-    }
-
-    /// Stage the newest version into the idle slot while the app runs, so the
-    /// next launch starts the new harness and can still fall back to this one.
-    ///
-    /// Deliberately waits until the running version has been up for the trial
-    /// period. The idle slot is the fallback, and an update replaces its
-    /// contents — so updating it while a freshly installed version is still on
-    /// trial would destroy the only known-good copy at exactly the moment it
-    /// might be needed. Only once the running version has proven it stays up
-    /// does the other slot become expendable.
-    private func updateIdleSlotInBackground() {
-        guard managed.isEnabled, managed.autoUpdateEnabled else { return }
-        updateWorkItem?.cancel()
-
-        let slot = runningSlot ?? managed.state.preferred
-        // The trial wait exists to protect the fallback, so it only applies when
-        // there is one. A first run with nothing installed yet can start right
-        // away.
-        let elapsed = readyAt.map { Date().timeIntervalSince($0) } ?? 0
-        let wait = managed.idleSlotIsFallback(activeSlot: slot)
-            ? max(ManagedInstall.earlyExitSeconds - elapsed, 5)
-            : 5
-
-        let item = DispatchWorkItem { [weak self] in
-            guard let self else { return }
-            self.managed.recordStable(slot: slot)
-            self.managed.updateIdleSlot(activeSlot: slot) { [weak self] outcome in
-                guard let self, let version = outcome.stagedVersion else { return }
-                self.reportUpdateStaged(version)
-            }
-        }
-        updateWorkItem = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + wait, execute: item)
-    }
+    @objc private func restartHarness() { lifecycle.start(reason: "restart command", force: true) }
 
     @objc private func checkForUpdates() {
-        guard managed.isEnabled else {
-            showFailure("Managed updates are off (DSH_MANAGED=0), so there is nothing to check.")
+        guard lifecycle.managedUpdatesEnabled else {
+            showBanner(
+                "Managed updates are off",
+                detail: "The app was launched with DSH_MANAGED=0, so there is nothing to check.",
+                kind: .warning)
             return
         }
         reportUpdateChecking()
-        managed.updateIdleSlot(activeSlot: runningSlot ?? managed.state.preferred, force: true) {
-            [weak self] outcome in
+        lifecycle.checkForUpdates { [weak self] outcome in
             guard let self else { return }
             switch outcome {
             case .staged(let version):
@@ -1904,10 +2196,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     /// Reinstall the idle slot even if it is already newest — the way out of a
     /// slot that has been marked broken.
     @objc private func reinstallHarness() {
-        guard managed.isEnabled else { return }
+        guard lifecycle.managedUpdatesEnabled else { return }
         reportUpdateChecking()
-        managed.updateIdleSlot(activeSlot: runningSlot ?? managed.state.preferred, force: true) {
-            [weak self] outcome in
+        lifecycle.reinstallIdleSlot { [weak self] outcome in
             guard let self else { return }
             if let version = outcome.stagedVersion {
                 self.showBanner(
@@ -1922,10 +2213,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             }
         }
     }
-
-    @objc private func retryStartup() { startHarness("retry button") }
-
-    @objc private func restartHarness() { startHarness("restart command", force: true) }
 
     // MARK: Alerts
 
@@ -1987,7 +2274,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     /// app did about it. The harness's own error text goes to the log instead,
     /// where it is useful for diagnosis and unreadable as a notification.
     private func alertRollback(
-        failed: String, recovered: String, reason: String, cause: RollbackCause
+        failed: String, recovered: String, reason: String, cause: HarnessLifecycle.RollbackCause
     ) {
         let headline: String
         let explanation: String
@@ -2016,10 +2303,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
             kind: .info)
     }
 
-    private func reportUpdateAdopted() {
-        Log.shared.write("running the newly installed harness")
-    }
-
     private func reportUpdateChecking() {
         showBanner(
             "Checking for Harness updates…",
@@ -2028,7 +2311,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     }
 
     @objc private func reloadHarness() {
-        guard let url = authenticatedURL else { return startHarness("reload with no server") }
+        guard let url = lifecycle.authenticatedURL else {
+            return lifecycle.start(reason: "reload with no server")
+        }
         webView.load(URLRequest(url: url))
     }
 
@@ -2133,11 +2418,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate, 
     private func reportLoadFailure(_ error: Error) {
         Log.shared.write("navigation failed: \(error.localizedDescription)")
         // The server being down is the expected cause, not a broken page.
-        if !server.isRunning {
-            overlay.showFailure(
-                "The Harness server is not running.",
-                detail: server.recentLog())
-        }
+        guard !lifecycle.isServerRunning else { return }
+        overlay.showFailure(
+            "The Harness server is not running.",
+            detail: lifecycle.recentServerLog)
     }
 
     /// Keep harness-internal navigation in this window; hand genuine external
@@ -2284,13 +2568,19 @@ enum ContractCheck {
     }
 
     private static func fetchStatus(_ url: URL) -> Int? {
-        var status: Int?
+        // The completion arrives on URLSession's own queue and is read from the
+        // main thread below, so the hand-off is synchronized rather than shared
+        // through a captured `var`.
+        let status = Handoff<Int>()
+        let done = DispatchSemaphore(value: 0)
         let task = URLSession.shared.dataTask(with: url) { _, response, _ in
-            status = (response as? HTTPURLResponse)?.statusCode
+            if let code = (response as? HTTPURLResponse)?.statusCode { status.set(code) }
+            done.signal()
         }
         task.resume()
-        wait(until: { status != nil }, timeout: 30)
-        return status
+        wait(until: { status.value != nil }, timeout: 30)
+        _ = done.wait(timeout: .now() + 1)
+        return status.value
     }
 }
 
@@ -2353,6 +2643,7 @@ enum InstallHarness {
 /// Tests for the A/B update bookkeeping: which slot is booted, and how a slot
 /// that fails to boot hands over to the other one. These encode the guarantee
 /// that a broken upstream release cannot leave the app unusable.
+#if DSH_TESTS
 enum UpdateTests {    static func run() -> Never {
         var failures = 0
 
@@ -2459,6 +2750,128 @@ enum UpdateTests {    static func run() -> Never {
         finish(1)
     }
 }
+#endif
+
+/// Tests for the threading guarantees the update path depends on.
+///
+/// These exist because the code got this wrong in two ways that only showed up
+/// under load: `healthCheck` shared a `var` with a URLSession callback and spun
+/// its own run loop, and `ManagedInstall.state` was read on the update queue
+/// while the main queue wrote to it. Both are invisible in single-threaded
+/// tests, which is exactly why they survived. Running the real paths
+/// concurrently is the only way to keep them fixed — the lost-update check below
+/// fails on the old code.
+#if DSH_TESTS
+enum ConcurrencyTests {
+    static func run() -> Never {
+        var failures = 0
+
+        // These write slot records, so they must not touch a real install.
+        let scratch = NSTemporaryDirectory() + "dsh-mac-concurrency-tests-\(UUID().uuidString)"
+        setenv("DSH_APP_SUPPORT", scratch, 1)
+        func finish(_ code: Int32) -> Never {
+            try? FileManager.default.removeItem(atPath: scratch)
+            exit(code)
+        }
+        func check(_ condition: Bool, _ label: String) {
+            print(condition ? "  [ ok ] \(label)" : "  [FAIL] \(label)")
+            if !condition { failures += 1 }
+        }
+
+        print("concurrency tests")
+
+        // ── the state lock ───────────────────────────────────────────────────
+
+        // Every recorded crash must survive. Without the lock, concurrent
+        // read-modify-write of the same slot loses updates: the count lands
+        // below the number of calls and the app would under-count crashes, so a
+        // genuinely broken release would not trip the crash loop.
+        let manager = ManagedInstall()
+        manager.setSlot("a", Slot(version: "1.0.0", installedAt: Date(), verifiedAt: Date()))
+
+        let threads = 8
+        let perThread = 25
+        let group = DispatchGroup()
+        for _ in 0..<threads {
+            DispatchQueue.global().async(group: group) {
+                for _ in 0..<perThread {
+                    _ = manager.recordEarlyExit(slot: "a", uptime: 5)
+                }
+            }
+        }
+        group.wait()
+
+        let recorded = manager.state.slots["a"]?.earlyExits.count ?? -1
+        check(
+            recorded == threads * perThread,
+            "concurrent crash reports all survive (\(recorded) of \(threads * perThread))")
+
+        // Reads taken while writers run must not crash and must stay coherent.
+        // A torn read here would be an unreadable `InstalledState` at boot.
+        let readers = DispatchGroup()
+        let observed = Handoff<Int>()
+        var reads = 0
+        let readLock = NSLock()
+        for _ in 0..<4 {
+            DispatchQueue.global().async(group: readers) {
+                for _ in 0..<50 {
+                    _ = manager.version(of: "a")
+                    _ = manager.preferredSlot
+                    _ = manager.idleSlotIsFallback(activeSlot: "a")
+                    readLock.lock()
+                    reads += 1
+                    readLock.unlock()
+                }
+            }
+        }
+        readers.wait()
+        observed.set(reads)
+        check(observed.value == 200, "concurrent reads complete (\(observed.value ?? -1) of 200)")
+
+        // ── healthCheck threading ────────────────────────────────────────────
+
+        // A candidate that cannot run must be reported, not hung on. The old
+        // implementation spun a run loop waiting for callbacks that were
+        // dispatched to the main queue, so calling it off-main could only work
+        // if somebody else happened to be pumping main.
+        let missing = Handoff<String?>()
+        let missingDone = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            missing.set(ManagedInstall.healthCheck(dsh: "/nonexistent/dsh", timeout: 20))
+            missingDone.signal()
+        }
+        let waited = missingDone.wait(timeout: .now() + 60)
+        check(waited == .success, "healthCheck returns from a background queue")
+        check(missing.value ?? nil != nil, "an unrunnable candidate is reported as unhealthy")
+
+        // Several at once, which is what an update racing a manual check looks
+        // like. None may crash, hang, or come back healthy.
+        let many = DispatchGroup()
+        let verdicts = Handoff<Int>()
+        var unhealthy = 0
+        let verdictLock = NSLock()
+        for _ in 0..<4 {
+            DispatchQueue.global().async(group: many) {
+                let verdict = ManagedInstall.healthCheck(dsh: "/nonexistent/dsh", timeout: 20)
+                verdictLock.lock()
+                if verdict != nil { unhealthy += 1 }
+                verdictLock.unlock()
+            }
+        }
+        let manyDone = many.wait(timeout: .now() + 120)
+        verdicts.set(unhealthy)
+        check(manyDone == .success, "concurrent health checks all finish")
+        check(verdicts.value == 4, "every concurrent health check reports the failure")
+
+        if failures == 0 {
+            print("all concurrency tests passed")
+            finish(0)
+        }
+        print("\(failures) concurrency test(s) failed")
+        finish(1)
+    }
+}
+#endif
 
 /// Tests for the notice card's appearance.
 ///
@@ -2467,6 +2880,7 @@ enum UpdateTests {    static func run() -> Never {
 /// background is translucent, the harness shows through and the message that
 /// matters most becomes the hardest to read. These render the card offscreen
 /// and inspect the pixels, so that property is checked rather than assumed.
+#if DSH_TESTS
 enum NoticeTests {
     static func run() -> Never {
         // AppKit needs an application instance before any view can be drawn.
@@ -2582,10 +2996,12 @@ enum NoticeTests {
         exit(1)
     }
 }
+#endif
 
 /// Tests for {@link HarnessServer.readyURL}, the single piece of harness output
 /// this app interprets. These run in CI so that a change to that log line fails
 /// loudly here, rather than silently in someone's window.
+#if DSH_TESTS
 enum ParserTests {
     static func run() -> Never {
         var failures = 0
@@ -2677,6 +3093,7 @@ enum ParserTests {
         exit(1)
     }
 }
+#endif
 
 let arguments = Array(CommandLine.arguments.dropFirst())
 
@@ -2685,6 +3102,10 @@ if arguments.contains("--selftest") {
     exit(0)
 }
 
+#if DSH_TESTS
+// The unit-test runners. Compiled only into a test build (`DSH_BUILD_TESTS=1`),
+// so a shipped app carries no test code and cannot be asked to run it. They are
+// not diagnostics: nothing a user needs is behind these flags.
 if arguments.contains("--test-parser") {
     ParserTests.run()
 }
@@ -2693,12 +3114,31 @@ if arguments.contains("--test-update") {
     UpdateTests.run()
 }
 
-if arguments.contains("--install-harness") {
-    InstallHarness.run()
-}
-
 if arguments.contains("--test-notice") {
     NoticeTests.run()
+}
+
+if arguments.contains("--test-concurrency") {
+    ConcurrencyTests.run()
+}
+#else
+// Refuse rather than falling through to the GUI: silently opening a window for
+// `--test-parser` would look like the flag worked.
+for flag in ["--test-parser", "--test-update", "--test-notice", "--test-concurrency"] {
+    if arguments.contains(flag) {
+        FileHandle.standardError.write(Data("""
+            \(flag) is a unit-test runner and is not compiled into a release build.
+
+            Build one with:  DSH_BUILD_TESTS=1 ./build.sh
+
+            """.utf8))
+        exit(2)
+    }
+}
+#endif
+
+if arguments.contains("--install-harness") {
+    InstallHarness.run()
 }
 
 if arguments.contains("--check-contract") {

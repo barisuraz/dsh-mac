@@ -147,20 +147,33 @@ Claim 3 is a log line rather than a documented interface, so `--test-parser` and
 APP="/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeekHarness"
 
 "$APP" --selftest          # what it resolved
-"$APP" --test-parser       # readiness-line parser, including refusals
-"$APP" --test-update       # A/B slots and crash-loop detection
-"$APP" --test-notice       # notice card rendering
 "$APP" --install-harness   # fetch a harness into a slot, headless
 "$APP" --check-contract    # start a real harness and verify the contract
 "$APP" --screenshot out.png --notice rollback   # render the window to a PNG
 
+./tools/test-ab.sh         # recovery, against deliberately broken harnesses
 ./tools/test-repair.sh     # session-log repair, against synthetic logs
 
 # Recover a session a plugin made unloadable (see below).
 python3 tools/repair-sessions.py <session.v3.jsonl.zstd> --type <event-type>
-
-./tools/test-ab.sh         # recovery, against deliberately broken harnesses
 ```
+
+The unit-test runners are **not** in a release build — `--test-parser` and the
+rest exit 2 there. Build one that has them:
+
+```sh
+DSH_BUILD_DIR=build-tests DSH_BUILD_TESTS=1 ./build.sh
+BIN="build-tests/DeepSeek Harness.app/Contents/MacOS/DeepSeekHarness"
+
+"$BIN" --test-parser       # readiness-line parser, including refusals
+"$BIN" --test-update       # A/B slots and crash-loop detection
+"$BIN" --test-notice       # notice card rendering
+"$BIN" --test-concurrency  # the state lock and healthCheck, under real threads
+```
+
+`--test-concurrency` is the one to keep an eye on: it drives the update paths
+from several threads at once, which is the only way the races in them are
+visible.
 
 ## Recovering an unloadable session
 
@@ -213,6 +226,7 @@ The harness runs local code execution behind a loopback URL, and the app respect
 
 ```
 Sources/main.swift          the entire app: window, launcher, supervisor, slots, diagnostics
+                            (HarnessLifecycle decides what runs; AppDelegate draws it)
 install.sh                  the download-and-install one-liner
 build.sh                    compiles, assembles, icons, and signs the bundle
 tools/package.sh            builds a release disk image and verifies it by mounting it
