@@ -44,6 +44,21 @@ cp -R "build/DeepSeek Harness.app" /Applications/
 
 `build.sh` downloads nothing and takes a few seconds.
 
+The bundle under `build/` is build output, not the app you use — copy it to
+`/Applications` and launch that copy. `build.sh` marks the directory so Spotlight
+leaves it alone; without that, the loose bundle is indexed as a second
+"DeepSeek Harness" and shows up as a duplicate in Spotlight and Launchpad. If one
+is already registered, remove it and unregister the stray path:
+
+```sh
+rm -rf "build/DeepSeek Harness.app"
+lsregister -u "$PWD/build/DeepSeek Harness.app"
+```
+
+with `lsregister` being
+`/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister`.
+Restart the Dock afterwards (`killall Dock`) so Launchpad rebuilds its list.
+
 ## What it is
 
 One Swift file. It is a shell, not a fork: no harness logic, no reimplemented UI, no DSH config, API, or plugin interface. Everything in the window is upstream DSH, so new harness features appear as soon as they ship.

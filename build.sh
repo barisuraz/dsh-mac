@@ -20,6 +20,15 @@ command -v swiftc >/dev/null 2>&1 || {
 
 mkdir -p "$CACHE"
 
+# A built copy is a second "DeepSeek Harness" on the machine while the real one
+# sits in /Applications. macOS indexes and registers any application bundle it
+# finds, so the build output turns up in Spotlight and Launchpad as a duplicate
+# icon, and can be launched in place of the installed app. This marker tells
+# Spotlight to leave the build directory alone, which keeps local builds out of
+# both. It goes in before the bundle exists so the app is never indexed.
+mkdir -p "$HERE/build"
+touch "$HERE/build/.metadata_never_index"
+
 # -module-cache-path keeps clang's module cache inside the project: the default
 # cache lives in the system temp directory, which a sandboxed shell may not write.
 COMMON_FLAGS=(-O -swift-version 5 -module-cache-path "$CACHE/modules")
